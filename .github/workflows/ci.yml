@@ -10,7 +10,12 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+      # No root package.json in this repo (the model is the only package),
+      # so pnpm/action-setup has no packageManager field to read: pin the
+      # version explicitly. Matches sevynos's pnpm@11.17.0 pin.
       - uses: pnpm/action-setup@v4
+        with:
+          version: 11.17.0
       - uses: actions/setup-node@v5
         with:
           node-version: 24
@@ -58,7 +63,10 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+      # See the model job: no root package.json, so pin pnpm explicitly.
       - uses: pnpm/action-setup@v4
+        with:
+          version: 11.17.0
       - uses: actions/setup-node@v5
         with:
           node-version: 24
