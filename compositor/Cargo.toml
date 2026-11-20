@@ -10,4 +10,38 @@ name = "sevyn-compositor"
 path = "src/main.rs"
 
 [dependencies]
-smithay = "0.7"
+# Smithay 0.7.0, pinned (see COMPOSITOR_PLAN.md, "Language: Rust").
+#
+# Stage 2 is the nested compositor only, so only the features it needs are
+# enabled — deliberately NOT the default set:
+#   backend_winit     — the nested backend: Genesis runs as a Wayland client
+#                       (a winit window) inside the parent compositor.
+#   wayland_frontend  — the Wayland server side (compositor, shm, output,
+#                       seat, xdg-shell).
+#   desktop           — Space + Window: the compositor-owned scene. Genesis
+#                       places every surface; clients never position
+#                       themselves (this is the property Stage 4 adoption
+#                       relies on).
+#   renderer_gl       — the GLES renderer used by the winit backend.
+#
+# NOT enabled in Stage 2 (each arrives with its stage, per the plan):
+#   backend_drm / backend_libinput / backend_udev / backend_session —
+#       Stage 3 (standalone: DRM/KMS, libinput, session). Enabling them
+#       would also pull libseat/libgbm/libinput system libraries that the
+#       nested compositor never uses.
+#   xwayland — never (no X clients on SevynOS).
+#   renderer_pixman — Stage 3 (software fallback, proven with GLES off).
+#   backend_vulkan / renderer_glow — not needed.
+smithay = { version = "0.7", default-features = false, features = [
+    "backend_winit",
+    "wayland_frontend",
+    "desktop",
+    "renderer_gl",
+] }
+# Signal handling only (SIGTERM/SIGINT → clean shutdown). Already a
+# transitive dependency via Smithay; listed directly so the use is explicit.
+libc = "0.2"
+# Bridge socket messages (newline-delimited JSON, protocol version 1).
+# Already in the lockfile as transitive dependencies; listed directly.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
