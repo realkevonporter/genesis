@@ -144,8 +144,10 @@ script runs in CI.
   exist as clients yet; the test client stands in for an application,
   and the bridge markers are the association record the Runtime will
   consume. Process launch by the compositor is a Stage 3/Runtime item.
-- **No adoption.** `foreign_toplevel_list` is not advertised and no
-  manager global is implemented — that is Stage 4 (see the plan's
+- **No foreign-toplevel manager yet.** Stage 4 Track 1 (adoption
+  core) is built — see "Stage 4 — adoption" below — but
+  `foreign_toplevel_list` is not advertised and no manager global is
+  implemented; that is the manager track's work (see the plan's
   honest gap: Smithay 0.7.0 ships the list protocol but not
   `zwlr_foreign_toplevel_manager_v1`).
 - **No dmabuf proof, no frame-rate claim.** SHM is the buffer path in
@@ -443,6 +445,158 @@ it. See `compositor/RECOVERY.md`.
   migration (see "Protocols" above); **cursor-shape** renders every
   named shape as the one built-in arrow; **the DPMS timeout** has no
   Settings UI yet (fixed 5 minutes).
+
+## Stage 4 — adoption (Track 1: adoption core)
+
+Adoption embeds a Chromium window inside a Browser window: the
+Runtime asks the compositor over the bridge socket to place a
+Chromium surface at a rect inside a Browser window, clipped to that
+rect, and the compositor routes pointer and keyboard input to the
+right surface. Identification is by **pid**, not app_id (see
+"Identification" below). The adopted Chromium window is unmapped
+from the `Space` while adopted and rendered explicitly by both
+backends (nested and standalone) at
+(Browser window output position + rect origin), clipped to the rect
+by Smithay's `CropRenderElement` — Chromium pixels never paint
+outside the content area. The placement is computed at render time
+from the Browser window's live position, so a move is structural
+(same frame, no second window), which is the fix for the M13 drag
+drift.
+
+### Runtime bridge: Stage 4 ops
+
+Same socket, same rules as v1 (Unix socket
+`$XDG_RUNTIME_DIR/sevyn-compositor.sock`, mode 0600, newline JSON,
+`{"v": 1, ...}`). The four ops:
+
+```json
+{ "v": 1, "op": "adopt", "session": "<browser-session-id>", "chromium_pid": 1234, "rect": { "x": 0, "y": 152, "w": 800, "h": 348 } }
+{ "v": 1, "op": "move", "session": "...", "rect": { "x": 0, "y": 100, "w": 800, "h": 150 } }
+{ "v": 1, "op": "resize", "session": "...", "rect": { "x": 0, "y": 152, "w": 800, "h": 148 } }
+{ "v": 1, "op": "release", "session": "..." }
+```
+
+- `adopt`: record the adoption. `move`: reposition the adopted
+  element by the rect change in the same frame — no configure is
+  sent to Chromium. `resize`: same as `move`, plus an
+  `xdg_toplevel.configure` with the new content size
+  (rect.w x rect.h). `release`: drop the record; the Chromium window
+  returns to standalone placement (cascade) as its own window.
+- Responses keep the v1 shape:
+  `{"v":1,"ok":true,"op":"...","session":"..."}` /
+  `{"v":1,"ok":false,"op":"...","error":"..."}`. Error strings:
+  `"unknown session"`, `"dead chromium pid"`,
+  `"rect outside browser window"`, `"malformed request"`,
+  `"already adopted"`, `"runtime disconnected"`.
+- Async event, pushed on all connected bridge clients when the
+  adopted Chromium process dies:
+  `{"v":1,"event":"chromium_died","session":"..."}`.
+
+### Auth: `--runtime-pid`
+
+`sevyn-compositor --runtime-pid <pid>` binds the bridge to the
+Runtime's pid (init passes it at launch). When set, the bridge
+admits **only** that pid (`SO_PEERCRED` pid check; a wrong pid gets
+EOF and a `bridge: rejected a connection from pid=...` diagnostic).
+When unset, the Stage 2/3 same-uid auth applies. The `READY` marker
+reports `runtime_pid=<pid|(any same-uid)>`.
+
+The standalone backend registers one calloop source per live
+bridge connection (`sync_bridge_sources` in `drm.rs`, dups from
+`BridgeServer::connection_watch_fds`), so a request on an existing
+connection wakes the loop in the round it arrives. The listener fd
+alone only fires on *new* connections — without the per-connection
+sources a request sat until some other source (a pointer move, a
+client message) happened to fire the loop, and every bridge request
+timed out at the Runtime. The nested backend does not need this: it
+pumps every 2 ms, so `bridge.poll` runs continuously there.
+
+### Identification
+
+By pid (`wl_client_get_credentials` on the toplevel's `wl_surface`),
+never by app_id. app_id (`chromium`) is a sanity check only: a
+mismatch is logged as a diagnostic and never blocks adoption, and a
+client claiming app_id `chromium` with the wrong pid is never
+adopted, because the pid match fails first. Chromium pid liveness is
+also checked with `kill(pid, 0)` at adopt time. Adopting the Browser
+window into itself (chromium_pid == the Browser's pid) is rejected
+as `"malformed request"`.
+
+### Focus policy (adoption)
+
+- Pointer hit-test runs adoption-first: a position inside the
+  content rect hits the adopted Chromium surface; elsewhere in the
+  window it hits the Browser chrome surfaces (normal `Space`
+  hit-test).
+- Click content → the Chromium surface gets keyboard focus; the
+  Browser toplevel stays `Activated`. Click chrome → the Browser
+  app. A press raises the Browser window, never the adopted
+  toplevel alone. Keyboard focus is click-to-focus only — hover
+  never moves it (the Stage 2 rule stands; the plan's "pointer over
+  the content rect" line is implemented as click-to-focus, see
+  "Plan ambiguities" below).
+- The adopted toplevel is never activated except through the Browser
+  window's focus. Activation requests for adopted surfaces that did
+  not come via the Browser window are ignored, including
+  xdg-activation (`ACTIVATION IGNORED adopted surface=<id>` in the
+  log); the manager track routes its activate through
+  `is_adopted`.
+
+### Lifecycle
+
+- **Chromium dies** → the adoption is removed, the Runtime is
+  notified with the `chromium_died` event, the Browser window stays
+  open (`ADOPTION CHROMIUM DIED session=... chromium=... pid=...`).
+- **Browser closes** → the adoption is dropped
+  (`ADOPTION DROPPED session=... reason=browser-closed`).
+- **Runtime dies** → the compositor keeps presenting the last scene
+  and refuses new adoptions until the Runtime reconnects
+  (`RUNTIME DISCONNECTED degraded: refusing new adoptions until the
+  Runtime reconnects`, `RUNTIME RECONNECTED` on reconnect). The
+  degraded state only fires after a connection has existed; a
+  connection that never connected is not a disconnect.
+- **No separate `register` op exists in v1.** "The Runtime
+  reconnects and re-registers" is implemented as: the bridge
+  (re)connection itself is the re-registration.
+
+### Markers
+
+`ADOPTION ADOPTED session=... browser=... chromium=... pid=...
+rect=x,y,w,h`, `ADOPTION MOVED ...`, `ADOPTION RESIZED ...
+size=WxH rect=...`, `ADOPTION RELEASED session=...
+chromium=...`, `ADOPTION CHROMIUM DIED ...`,
+`ADOPTION DROPPED ... reason=browser-closed`,
+`RUNTIME DISCONNECTED ...`, `RUNTIME RECONNECTED ...`,
+`ACTIVATION IGNORED adopted surface=...`.
+
+### Plan ambiguities (Stage 4, recorded — not silently resolved)
+
+1. **No `register` op.** See "Lifecycle" above: (re)connection is
+   the re-registration.
+2. **Hover vs keyboard focus.** Click-to-focus only; hover never
+   moves keyboard focus.
+3. **No window-move API exists** in Stage 2/3, so "Browser window
+   moves → same delta, same frame" can only be exercised via the
+   bridge `move` op (a rect change), not via an actual `Space`
+   relocation. The derived-location design makes both the same
+   render-time code path.
+
+### Proof (Track 1)
+
+- Nested (sandbox, `compositor/tests/nested-check.sh` PASS plus a
+  throwaway harness, 59/59 checks): all hostile adopt cases, valid
+  adopt, already-adopted, move (hit-test follows the new rect, no
+  configure sent), resize (configure 800x148 received), clipping by
+  pixels, focus routing both ways, Chromium-death event + Browser
+  survival, `--runtime-pid` rejection + degraded/reconnect,
+  release (standalone repaint, keys, re-adopt), Browser close
+  drops the adoption, clean shutdown, no orphans. Proof logs in
+  `~/workspace/stage4-adoption-proof/`.
+- Standalone (KVM box, QEMU virtio-gpu): same sequence driven
+  through the bridge with QMP pointer/keys and screendump pixels —
+  see `ACCEPTANCE.md`.
+- **Not proven:** real Shell/Chromium embedding is sevynos-side
+  Stage 5 work; GF65 hardware proof is owed.
 
 ## Build
 

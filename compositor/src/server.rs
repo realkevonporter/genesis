@@ -65,6 +65,7 @@ use smithay::{
 };
 
 use crate::{
+    adoption::Adoption,
     cursor::build_default_cursor_buffer,
     drm::DrmRenderer,
     marker, output as output_mod,
@@ -257,6 +258,21 @@ pub struct GenesisState {
 
     /// Client connect/disconnect events, pushed by `ClientState`.
     pub client_events: Arc<Mutex<Vec<ClientEvent>>>,
+
+    // --- Stage 4 adoption state (see `adoption.rs`). Kept in this
+    // clearly separate region: the manager track owns the
+    // protocol-state fields elsewhere in this struct, not these.
+    /// Live adoptions: one per Browser window (see `adoption.rs`).
+    pub adoptions: Vec<Adoption>,
+    /// Bridge events queued for the Runtime (currently only
+    /// `chromium_died`); drained into bridge connections by
+    /// `BridgeServer::poll` (see `runtime_bridge.rs`).
+    pub pending_bridge_events: Vec<String>,
+    /// True after the Runtime's bridge connection drops, until it
+    /// reconnects. While degraded the compositor keeps presenting
+    /// the last scene but refuses new adoptions (see
+    /// `GenesisState::adopt`).
+    pub runtime_degraded: bool,
 }
 
 impl GenesisState {
@@ -386,6 +402,9 @@ impl GenesisState {
             dpms_off: false,
             wants_dpms: None,
             client_events: Arc::new(Mutex::new(Vec::new())),
+            adoptions: Vec::new(),
+            pending_bridge_events: Vec::new(),
+            runtime_degraded: false,
         }
     }
 
@@ -441,7 +460,26 @@ impl GenesisState {
     /// Give keyboard focus to a window (or clear it), updating the
     /// `Activated` state on the affected toplevels. Called on map and on
     /// pointer press (see `input.rs`).
+    ///
+    /// Stage 4 guard: an adopted Chromium surface is never focused
+    /// directly — focus routes through its Browser window (see
+    /// `GenesisState::focus_adopted`), so the `Activated` state stays
+    /// on the Browser toplevel while keys go to the page.
     pub fn set_keyboard_focus(&mut self, window: Option<&Window>) {
+        if let Some(window) = window {
+            if let Some(adoption) = self.adoption_for_chromium_window(window) {
+                let browser_surface_id = adoption.browser_surface_id;
+                let browser = self
+                    .registry
+                    .get(browser_surface_id)
+                    .map(|record| record.window.clone());
+                if let Some(browser) = browser {
+                    let chromium = window.clone();
+                    self.focus_adopted(&browser, &chromium);
+                    return;
+                }
+            }
+        }
         let serial = self.next_serial();
         let target_id = window.and_then(|window| {
             self.registry
@@ -542,6 +580,11 @@ impl GenesisState {
             .filter(|record| !live.contains(&record.object_id))
             .map(|record| (record.id, record.session.clone(), record.close_requested))
             .collect();
+        // Stage 4: drop adoptions whose Browser or Chromium surface is
+        // gone first — a dead Chromium notifies the Runtime with the
+        // `chromium_died` event (see `adoption.rs`).
+        let gone_ids: Vec<u64> = gone.iter().map(|(id, _, _)| *id).collect();
+        self.reconcile_adoptions(&gone_ids);
         let mut focus_lost = false;
         for (id, session, close_requested) in gone {
             if self.keyboard_focus_id == Some(id) {
@@ -844,6 +887,22 @@ impl XdgActivationHandler for GenesisState {
         _token_data: smithay::wayland::xdg_activation::XdgActivationTokenData,
         surface: WlSurface,
     ) {
+        // Stage 4: an adopted Chromium surface is never activated
+        // except through its Browser window's focus. Activation
+        // requests for adopted surfaces that did not come via the
+        // Browser window are ignored (the manager track routes its
+        // own activate through `is_adopted` the same way).
+        if let Some(record) = self
+            .registry
+            .records()
+            .iter()
+            .find(|record| record.object_id == surface.id())
+        {
+            if self.is_adopted(record.id) {
+                marker!("ACTIVATION IGNORED adopted surface={}", record.id);
+                return;
+            }
+        }
         let window = self
             .registry
             .records()

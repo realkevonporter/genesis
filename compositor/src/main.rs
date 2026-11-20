@@ -16,8 +16,9 @@
 //!
 //! ```text
 //! sevyn-compositor [--socket <name>] [--size <WIDTHxHEIGHT>]
+//!     [--runtime-pid <pid>]
 //! sevyn-compositor --standalone [--socket <name>] [--scale N]
-//!     [--rotate 0|90|180|270] [--no-gles]
+//!     [--rotate 0|90|180|270] [--no-gles] [--runtime-pid <pid>]
 //! ```
 //!
 //! * `--socket` — the Wayland socket name in `$XDG_RUNTIME_DIR`
@@ -26,6 +27,11 @@
 //! * `--size` — nested mode only: the output size in logical pixels
 //!   (default `1280x800`). Ignored in standalone mode, which uses the
 //!   output's native mode.
+//! * `--runtime-pid <pid>` — Stage 4: init passes the Runtime's pid at
+//!   launch, and the bridge socket then admits ONLY that pid
+//!   (`SO_PEERCRED` pid check). When unset, the Stage 2/3 same-uid
+//!   auth stands (any process of the platform user may talk to the
+//!   bridge — the development posture, not the shipping one).
 //! * `--standalone` — run the DRM/KMS backend instead of the nested
 //!   winit backend. Needs a DRM device and a libseat session (a VT
 //!   session under logind/seatd); without one it fails cleanly with a
@@ -44,6 +50,7 @@
 //! (exit 0). Exit codes: 0 clean shutdown, 1 fatal startup/runtime
 //! failure (including DRM output lost), 2 usage error, 101 panic.
 
+mod adoption;
 mod backend;
 mod cursor;
 mod drm;
@@ -64,7 +71,7 @@ use smithay::utils::{Logical, Size};
 use drm::StandaloneConfig;
 
 fn usage() -> &'static str {
-    "usage: sevyn-compositor [--socket <name>] [--size <WIDTHxHEIGHT>]\n       sevyn-compositor --standalone [--socket <name>] [--scale N] [--rotate 0|90|180|270] [--no-gles]"
+    "usage: sevyn-compositor [--socket <name>] [--size <WIDTHxHEIGHT>] [--runtime-pid <pid>]\n       sevyn-compositor --standalone [--socket <name>] [--scale N] [--rotate 0|90|180|270] [--no-gles] [--runtime-pid <pid>]"
 }
 
 fn parse_size(text: &str) -> Result<Size<i32, Logical>, String> {
@@ -93,6 +100,7 @@ fn main() -> ExitCode {
     let mut rotate = smithay::utils::Transform::Normal;
     let mut no_gles = false;
     let mut size_given = false;
+    let mut runtime_pid: Option<u32> = None;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -106,6 +114,19 @@ fn main() -> ExitCode {
             }
             "--no-gles" => {
                 no_gles = true;
+            }
+            "--runtime-pid" => {
+                let text = args.next().unwrap_or_else(|| {
+                    diag!("--runtime-pid needs a value");
+                    std::process::exit(2);
+                });
+                match text.parse::<u32>() {
+                    Ok(pid) if pid > 0 => runtime_pid = Some(pid),
+                    _ => {
+                        diag!("bad --runtime-pid {text:?}, expected a positive pid");
+                        return ExitCode::from(2);
+                    }
+                }
             }
             "--socket" => {
                 socket_name = args.next().unwrap_or_else(|| {
@@ -171,6 +192,7 @@ fn main() -> ExitCode {
             scale,
             rotate,
             no_gles,
+            runtime_pid,
         };
         match drm::run_standalone(config) {
             Ok(()) => ExitCode::SUCCESS,
@@ -180,7 +202,7 @@ fn main() -> ExitCode {
             }
         }
     } else {
-        match backend::run(&socket_name, output_size) {
+        match backend::run(&socket_name, output_size, runtime_pid) {
             Ok(()) => ExitCode::SUCCESS,
             Err(err) => {
                 diag!("fatal: {err}");

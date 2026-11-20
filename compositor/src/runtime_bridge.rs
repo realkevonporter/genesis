@@ -21,18 +21,20 @@
 //!   recording the stopped state is a Stage 4+ consumer of this record.
 //! * The bridge socket (see `backend.rs`): a Unix socket speaking
 //!   newline-delimited JSON, protocol version [`BRIDGE_PROTOCOL_VERSION`],
-//!   with the Stage 2 op set (`ping`, `close`). Stage 4 extends the same
-//!   socket with `adopt` / `move` / `resize` / `release` — the op set is
-//!   additive within the version, and the socket path and auth story
-//!   (`SO_PEERCRED`, same-uid peer, mode 0600) are the plan's.
+//!   with the Stage 2 op set (`ping`, `close`) plus the Stage 4 adoption
+//!   ops (`adopt`, `move`, `resize`, `release` — see `adoption.rs`).
+//!   The op set is additive within the version, and the socket path and
+//!   auth story (`SO_PEERCRED`, same-uid peer, mode 0600) are the plan's;
+//!   Stage 4 adds pid-binding to the known Runtime pid (see
+//!   `--runtime-pid` and `BridgeServer::bind`).
 //!
 //! What does NOT exist yet (documented next steps, not silent gaps):
 //!
 //! * No Runtime process, so nothing consumes the markers yet and no
-//!   session id arrives from the Runtime.
-//! * No pid-binding to a known Runtime pid at launch (Stage 4: init passes
-//!   the Runtime pid to Genesis; the socket then admits only that pid).
-//! * No `adopt` / `move` / `resize` / `release` ops (Stage 4).
+//!   session id arrives from the Runtime — except through the bridge
+//!   ops themselves, which is how the adoption check drives it.
+//! * No separate `register` op: a Runtime (re)connection is itself the
+//!   re-registration (see `BridgeServer::poll`).
 
 use crate::marker;
 
@@ -119,7 +121,7 @@ pub fn disassociate(session: &SessionId, surface_id: u64, reason: &str) {
 use std::{
     io::{Read, Write},
     os::unix::{
-        io::AsRawFd,
+        io::{AsRawFd, BorrowedFd, OwnedFd},
         net::{UnixListener, UnixStream},
     },
     path::PathBuf,
@@ -129,10 +131,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{diag, server::GenesisState};
 
-/// The uid of the peer on a Unix socket, via `SO_PEERCRED`. (`std`'s
-/// `peer_cred` is still unstable on this toolchain, so the check is done
-/// with libc directly.)
-fn peer_uid(stream: &UnixStream) -> Option<u32> {
+/// The full `SO_PEERCRED` credentials of the peer on a Unix socket.
+fn peer_cred(stream: &UnixStream) -> Option<libc::ucred> {
     let mut cred = libc::ucred {
         pid: 0,
         uid: 0,
@@ -149,19 +149,35 @@ fn peer_uid(stream: &UnixStream) -> Option<u32> {
         )
     };
     if ret == 0 {
-        Some(cred.uid)
+        Some(cred)
     } else {
         None
     }
 }
+
+/// A content rect in Browser-window-local coordinates, as sent by the
+/// Runtime in `adopt` / `move` / `resize`.
+#[derive(Debug, Clone, Copy, Deserialize)]
+struct RectJson {
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+}
+
 /// One bridge request (one JSON object per line).
 #[derive(Debug, Deserialize)]
 struct BridgeRequest {
     /// Must equal [`BRIDGE_PROTOCOL_VERSION`].
     v: u32,
     op: String,
-    /// The session to act on (required for `close`).
+    /// The session to act on (required for `close`, `adopt`, `move`,
+    /// `resize`, `release`).
     session: Option<String>,
+    /// The Chromium pid, for `adopt` only.
+    chromium_pid: Option<u32>,
+    /// The content rect, for `adopt` / `move` / `resize` only.
+    rect: Option<RectJson>,
 }
 
 /// One bridge response (one JSON object per line).
@@ -203,6 +219,30 @@ struct BridgeConnection {
     stream: UnixStream,
     incoming: Vec<u8>,
     outgoing: Vec<u8>,
+    /// A dup of the stream's fd, kept so the standalone backend can
+    /// watch the connection for readability (see
+    /// [`BridgeServer::connection_watch_fds`]). It is a separate fd
+    /// number from the stream's, so closing the stream in `poll`
+    /// cannot recycle the number under a registered calloop source.
+    watch_fd: OwnedFd,
+}
+
+/// Try to flush one connection's outbox (non-blocking). Returns true
+/// if the connection is dead and must be dropped. A partial write
+/// drains what went out and leaves the rest for the next poll;
+/// WouldBlock is not an error.
+fn flush_connection(connection: &mut BridgeConnection) -> bool {
+    if connection.outgoing.is_empty() {
+        return false;
+    }
+    match connection.stream.write(&connection.outgoing) {
+        Ok(written) => {
+            connection.outgoing.drain(..written);
+            false
+        }
+        Err(ref err) if err.kind() == std::io::ErrorKind::WouldBlock => false,
+        Err(_) => true,
+    }
 }
 
 /// The bridge socket server. Shared by the nested and standalone
@@ -212,10 +252,22 @@ pub(crate) struct BridgeServer {
     connections: Vec<BridgeConnection>,
     /// The socket path, for removal at shutdown.
     pub(crate) path: PathBuf,
+    /// The Runtime pid passed with `--runtime-pid`, if any. When set,
+    /// the bridge admits ONLY that pid (see `poll`); when unset, the
+    /// Stage 2/3 same-uid auth stands.
+    runtime_pid: Option<u32>,
+    /// True once a Runtime connection has ever been accepted. The
+    /// degraded transition (last connection drops) only fires after
+    /// one has existed — a compositor that has never seen the Runtime
+    /// is not degraded, it is just waiting.
+    had_connection: bool,
 }
 
 impl BridgeServer {
-    pub(crate) fn bind(runtime_dir: &std::path::Path) -> std::io::Result<Self> {
+    pub(crate) fn bind(
+        runtime_dir: &std::path::Path,
+        runtime_pid: Option<u32>,
+    ) -> std::io::Result<Self> {
         let path = runtime_dir.join(BRIDGE_SOCKET_NAME);
         // A stale socket from a crashed run would make bind fail; remove
         // it first (a live compositor would still hold the file open, so
@@ -230,34 +282,101 @@ impl BridgeServer {
             listener,
             connections: Vec::new(),
             path,
+            runtime_pid,
+            had_connection: false,
         })
     }
 
-    /// Accept pending connections (same-uid peers only) and serve one
+    /// Accept pending connections (same-uid peers only; when
+    /// `--runtime-pid` was given, only that pid) and serve one
     /// complete request line per connection per call. Never blocks.
     /// A duplicated fd for the listener, for calloop sources: the
     /// standalone backend polls this fd and calls [`Self::poll`] when it
     /// is readable. (A dup, not a borrow: the event loop owns the source
     /// while the server lives in the loop data.)
     pub(crate) fn poll_fd(&self) -> std::io::Result<std::os::unix::io::OwnedFd> {
-        use std::os::unix::io::BorrowedFd;
         let borrowed = unsafe { BorrowedFd::borrow_raw(self.listener.as_raw_fd()) };
         borrowed.try_clone_to_owned()
     }
 
-    /// Accept pending connections (same-uid peers only) and serve one
-    /// complete request line per connection per call. Never blocks.
+    /// One dup per live connection, for the standalone backend to
+    /// watch: readability on a connection fd wakes the calloop loop,
+    /// so a request on an existing connection is served promptly.
+    /// Without this, the loop only wakes on the *listener* fd (a new
+    /// connection) and a request sits until some other source — a
+    /// pointer move, a client message — happens to fire. That is
+    /// exactly what the first standalone adoption run showed: every
+    /// bridge request timed out at the Runtime while the compositor
+    /// only processed it once a QMP pointer move woke the loop.
+    /// Each dup is a separate fd number from its stream's, keyed by
+    /// the dup's own number (see `drm.rs`): closing the stream in
+    /// `poll` cannot recycle the number under a registered source,
+    /// and a fresh connection always gets a fresh dup number.
+    pub(crate) fn connection_watch_fds(&self) -> Vec<OwnedFd> {
+        self.connections
+            .iter()
+            .filter_map(|connection| connection.watch_fd.try_clone().ok())
+            .collect()
+    }
+
+    /// Accept pending connections and serve one complete request line
+    /// per connection per call. Never blocks. Also drains the state's
+    /// queued bridge events (currently `chromium_died`) into every
+    /// connected client, and tracks the Runtime's presence: when the
+    /// last connection drops, the state goes degraded (the compositor
+    /// keeps presenting the last scene but refuses new adoptions);
+    /// when a connection arrives while degraded, the state recovers —
+    /// the connection itself is the Runtime's re-registration (there
+    /// is no separate register op in the v1 protocol).
     pub(crate) fn poll(&mut self, state: &mut GenesisState) {
+        // Drain queued events first, so a `chromium_died` queued by
+        // reconciliation in this same round reaches the Runtime on
+        // this poll. Events are kept (capped) while no client is
+        // connected, so a reconnecting Runtime still learns of them.
+        if !self.connections.is_empty() && !state.pending_bridge_events.is_empty() {
+            let events: Vec<String> = std::mem::take(&mut state.pending_bridge_events);
+            for event in events {
+                let mut bytes = event.into_bytes();
+                bytes.push(b'\n');
+                for connection in &mut self.connections {
+                    connection.outgoing.extend_from_slice(&bytes);
+                }
+            }
+        }
+        if state.pending_bridge_events.len() > 16 {
+            let excess = state.pending_bridge_events.len() - 16;
+            state.pending_bridge_events.drain(..excess);
+            diag!("bridge: dropped {excess} undelivered bridge event(s)");
+        }
+
         loop {
             match self.listener.accept() {
                 Ok((stream, _)) => {
                     // Trusted channel: the peer must be the same user.
-                    // (Stage 4 adds pid-binding to the known Runtime pid.)
-                    let allowed = peer_uid(&stream)
-                        .map(|uid| uid == unsafe { libc::getuid() })
+                    // When `--runtime-pid` was given, the peer must
+                    // additionally be exactly that pid — no other
+                    // same-uid process may adopt surfaces.
+                    let cred = peer_cred(&stream);
+                    let allowed = cred
+                        .map(|cred| {
+                            cred.uid == unsafe { libc::getuid() }
+                                && self
+                                    .runtime_pid
+                                    .map(|pid| cred.pid as u32 == pid)
+                                    .unwrap_or(true)
+                        })
                         .unwrap_or(false);
                     if !allowed {
-                        diag!("bridge: rejected a connection from another uid");
+                        if let Some(pid) = cred.map(|cred| cred.pid) {
+                            diag!(
+                                "bridge: rejected a connection from pid={pid} (expected runtime pid={})",
+                                self.runtime_pid
+                                    .map(|pid| pid.to_string())
+                                    .unwrap_or_else(|| "(any same-uid)".to_string())
+                            );
+                        } else {
+                            diag!("bridge: rejected a connection from another uid");
+                        }
                         continue;
                     }
                     if stream.set_nonblocking(true).is_err() {
@@ -267,10 +386,29 @@ impl BridgeServer {
                         diag!("bridge: too many connections, dropping one");
                         continue;
                     }
+                    if state.runtime_degraded {
+                        state.runtime_degraded = false;
+                        crate::marker!(
+                            "RUNTIME RECONNECTED degraded cleared: new adoptions accepted again"
+                        );
+                    }
+                    self.had_connection = true;
+                    // A dup of the stream's fd for the standalone
+                    // backend to watch (see `connection_watch_fds`).
+                    // The dup is taken here, at accept, so its number
+                    // is stable for the connection's lifetime.
+                    let watch_fd = {
+                        let borrowed = unsafe { BorrowedFd::borrow_raw(stream.as_raw_fd()) };
+                        match borrowed.try_clone_to_owned() {
+                            Ok(fd) => fd,
+                            Err(_) => continue,
+                        }
+                    };
                     self.connections.push(BridgeConnection {
                         stream,
                         incoming: Vec::new(),
                         outgoing: Vec::new(),
+                        watch_fd,
                     });
                 }
                 Err(ref err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
@@ -285,14 +423,8 @@ impl BridgeServer {
             {
                 let connection = &mut self.connections[index];
                 // Flush pending output first.
-                if !connection.outgoing.is_empty() {
-                    match connection.stream.write(&connection.outgoing) {
-                        Ok(written) => {
-                            connection.outgoing.drain(..written);
-                        }
-                        Err(ref err) if err.kind() == std::io::ErrorKind::WouldBlock => {}
-                        Err(_) => drop_connection = true,
-                    }
+                if flush_connection(connection) {
+                    drop_connection = true;
                 }
                 // Read what is available.
                 if !drop_connection {
@@ -335,6 +467,18 @@ impl BridgeServer {
                 let mut bytes = serde_json::to_vec(&response).unwrap_or_default();
                 bytes.push(b'\n');
                 self.connections[index].outgoing.extend_from_slice(&bytes);
+                // Flush the reply in this same poll instead of leaving
+                // it for the next one: the next poll only runs when
+                // some source fires, and a request that triggers no
+                // render or input would leave its reply stuck in the
+                // outbox until the Runtime does something else (the
+                // first standalone adoption run showed exactly that:
+                // a `close`'s {"ok":true} never arrived). A partial
+                // write or WouldBlock leaves the rest for the next
+                // poll's flush.
+                if flush_connection(&mut self.connections[index]) {
+                    drop_connection = true;
+                }
             }
             if drop_connection {
                 self.connections.remove(index);
@@ -342,16 +486,32 @@ impl BridgeServer {
                 index += 1;
             }
         }
+
+        // The Runtime is gone: no bridge client remains. The
+        // compositor keeps presenting the last scene, but new
+        // adoptions are refused until the Runtime reconnects and
+        // re-registers (see `poll`'s doc comment) — a degraded state,
+        // marked, not a silent hang.
+        if self.connections.is_empty() && self.had_connection && !state.runtime_degraded {
+            state.runtime_degraded = true;
+            crate::marker!(
+                "RUNTIME DISCONNECTED degraded: refusing new adoptions until the Runtime reconnects"
+            );
+        }
     }
 }
 
 /// Handle one bridge request line. `close` is the Shell asking the
 /// compositor to close an application (ADR-0006 milestone 9); `ping` is
-/// the liveness check.
+/// the liveness check. Stage 4 adds `adopt` / `move` / `resize` /
+/// `release` (see `adoption.rs` for the semantics and the exact error
+/// strings). A malformed request — bad JSON, a missing required field,
+/// a non-positive rect dimension — is `"malformed request"`; the
+/// adoption failures themselves carry their own strings.
 fn handle_bridge_request(state: &mut GenesisState, line: &[u8]) -> BridgeResponse {
     let request: BridgeRequest = match serde_json::from_slice(line) {
         Ok(request) => request,
-        Err(_) => return BridgeResponse::err("(unparsed)", "invalid JSON"),
+        Err(_) => return BridgeResponse::err("(unparsed)", "malformed request"),
     };
     if request.v != BRIDGE_PROTOCOL_VERSION {
         return BridgeResponse::err(&request.op, "unsupported protocol version");
@@ -360,7 +520,7 @@ fn handle_bridge_request(state: &mut GenesisState, line: &[u8]) -> BridgeRespons
         "ping" => BridgeResponse::ok("ping", None),
         "close" => {
             let Some(session) = request.session else {
-                return BridgeResponse::err("close", "missing session");
+                return BridgeResponse::err("close", "malformed request");
             };
             let Some(record) = state
                 .registry
@@ -372,6 +532,78 @@ fn handle_bridge_request(state: &mut GenesisState, line: &[u8]) -> BridgeRespons
             state.close_surface(record);
             state.needs_redraw = true;
             BridgeResponse::ok("close", Some(session))
+        }
+        "adopt" => {
+            let (Some(session), Some(chromium_pid), Some(rect)) =
+                (request.session, request.chromium_pid, request.rect)
+            else {
+                return BridgeResponse::err("adopt", "malformed request");
+            };
+            if rect.w <= 0 || rect.h <= 0 {
+                return BridgeResponse::err("adopt", "malformed request");
+            }
+            match state.adopt(
+                &session,
+                chromium_pid,
+                crate::adoption::ContentRect {
+                    x: rect.x,
+                    y: rect.y,
+                    w: rect.w,
+                    h: rect.h,
+                },
+            ) {
+                Ok(()) => BridgeResponse::ok("adopt", Some(session)),
+                Err(error) => BridgeResponse::err("adopt", error),
+            }
+        }
+        "move" => {
+            let (Some(session), Some(rect)) = (request.session, request.rect) else {
+                return BridgeResponse::err("move", "malformed request");
+            };
+            if rect.w <= 0 || rect.h <= 0 {
+                return BridgeResponse::err("move", "malformed request");
+            }
+            match state.move_adoption(
+                &session,
+                crate::adoption::ContentRect {
+                    x: rect.x,
+                    y: rect.y,
+                    w: rect.w,
+                    h: rect.h,
+                },
+            ) {
+                Ok(()) => BridgeResponse::ok("move", Some(session)),
+                Err(error) => BridgeResponse::err("move", error),
+            }
+        }
+        "resize" => {
+            let (Some(session), Some(rect)) = (request.session, request.rect) else {
+                return BridgeResponse::err("resize", "malformed request");
+            };
+            if rect.w <= 0 || rect.h <= 0 {
+                return BridgeResponse::err("resize", "malformed request");
+            }
+            match state.resize_adoption(
+                &session,
+                crate::adoption::ContentRect {
+                    x: rect.x,
+                    y: rect.y,
+                    w: rect.w,
+                    h: rect.h,
+                },
+            ) {
+                Ok(()) => BridgeResponse::ok("resize", Some(session)),
+                Err(error) => BridgeResponse::err("resize", error),
+            }
+        }
+        "release" => {
+            let Some(session) = request.session else {
+                return BridgeResponse::err("release", "malformed request");
+            };
+            match state.release_adoption(&session) {
+                Ok(()) => BridgeResponse::ok("release", Some(session)),
+                Err(error) => BridgeResponse::err("release", error),
+            }
         }
         _ => BridgeResponse::err(&request.op, "unknown op"),
     }

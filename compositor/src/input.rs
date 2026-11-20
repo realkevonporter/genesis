@@ -42,6 +42,25 @@
 //! Shell defines window/focus policy for the product (see COMPOSITOR_PLAN.md,
 //! "Window / focus policy"), and Genesis is the mechanism. When the Shell
 //! arrives, this module is where its policy lands.
+//!
+//! ## Stage 4 adoption focus policy (see COMPOSITOR_PLAN.md, Stage 4)
+//!
+//! * Pointer hit-test runs adoption-first: inside a Browser window's
+//!   adopted content rect, the pointer hits the adopted Chromium
+//!   surface; elsewhere in the window it hits the Browser chrome.
+//! * Clicking the content rect focuses the Chromium surface (keys go
+//!   to the page) while the `Activated` state stays on the Browser
+//!   toplevel; clicking the chrome focuses the Browser app.
+//! * The adopted toplevel is never activated except through the
+//!   Browser window's focus, and never raised on its own — a press
+//!   inside the rect raises the Browser window.
+//! * Pointer hover alone never moves keyboard focus (the Stage 2 rule
+//!   stands): keys go to the page after a click on the content, not
+//!   merely because the pointer is over it. This is the one reading
+//!   of the plan's "when the Browser window is focused and the pointer
+//!   is over the content rect, keys go to the page" that is consistent
+//!   with the hover rule; see `compositor/README.md` for the
+//!   ambiguity note.
 
 use smithay::{
     backend::{
@@ -96,6 +115,14 @@ fn clamp_to_output(state: &GenesisState, location: Point<f64, Logical>) -> Point
 /// **global compositor space** — or `None` when the pointer is over
 /// empty space.
 ///
+/// Stage 4 (adoption) runs first: a position inside a Browser window's
+/// adopted content rect hits the adopted Chromium surface; anywhere
+/// else in the window it hits the Browser chrome surfaces (the normal
+/// `Space` hit-test below — the adopted window is not in the `Space`,
+/// so the space test can only ever return the Browser window there).
+/// The adopted window's location is its Browser window's output
+/// position plus the rect origin, computed from the live scene.
+///
 /// The global origin is what Smithay's input handles expect:
 /// `PointerHandle::motion` and `TouchHandle::down` both document the
 /// focus point as "the coordinates of [the surface's] origin in the
@@ -107,10 +134,58 @@ fn hit_test(
     state: &GenesisState,
     location: Point<f64, Logical>,
 ) -> Option<(Window, WlSurface, Point<i32, Logical>)> {
+    for adoption in state.adoptions.clone() {
+        let Some(rect) = state.adopted_global_rect(&adoption) else {
+            continue;
+        };
+        let inside = location.x >= rect.loc.x as f64
+            && location.x < (rect.loc.x + rect.size.w) as f64
+            && location.y >= rect.loc.y as f64
+            && location.y < (rect.loc.y + rect.size.h) as f64;
+        if !inside {
+            continue;
+        }
+        let Some(chromium) = state
+            .registry
+            .get(adoption.chromium_surface_id)
+            .map(|record| record.window.clone())
+        else {
+            continue;
+        };
+        let Some(adopted_location) = state.adopted_location(&adoption) else {
+            continue;
+        };
+        let window_point = location - adopted_location.to_f64();
+        let (surface, surface_location) =
+            chromium.surface_under(window_point, WindowSurfaceType::ALL)?;
+        return Some((chromium, surface, adopted_location + surface_location));
+    }
     let (window, window_location) = state.space.element_under(location)?;
     let window_point = location - window_location.to_f64();
     let (surface, surface_location) = window.surface_under(window_point, WindowSurfaceType::ALL)?;
     Some((window.clone(), surface, window_location + surface_location))
+}
+
+/// The click-to-focus target for a pressed window: an adopted Chromium
+/// window focuses through its Browser window (the `Activated` state
+/// stays on the Browser toplevel, keys go to the page); any other
+/// window focuses directly. Returns the window to raise: the Browser
+/// window for an adopted hit (the whole window, content included,
+/// comes forward), the pressed window otherwise.
+fn focus_target(state: &GenesisState, window: &Window) -> (Window, Option<Window>) {
+    if let Some(browser) = state
+        .adoption_for_chromium_window(window)
+        .and_then(|adoption| {
+            state
+                .registry
+                .get(adoption.browser_surface_id)
+                .map(|record| record.window.clone())
+        })
+    {
+        (browser, Some(window.clone()))
+    } else {
+        (window.clone(), None)
+    }
 }
 
 /// Route a pointer motion event: update pointer focus to the leaf surface
@@ -164,6 +239,13 @@ pub fn pointer_motion(
 
 /// Route a pointer button event. On press, raise the window under the
 /// pointer and move keyboard focus to it (click-to-focus).
+///
+/// Stage 4: a press inside an adopted content rect raises the Browser
+/// window (the whole window, content included) and focuses the
+/// Chromium surface through it — the `Activated` state stays on the
+/// Browser toplevel (see `GenesisState::focus_adopted`). A press on
+/// the chrome focuses the Browser app. The adopted toplevel is never
+/// raised or activated on its own.
 pub fn pointer_button(
     state: &mut GenesisState,
     button: u32,
@@ -174,8 +256,12 @@ pub fn pointer_button(
     state.note_input_activity();
     if button_state == ButtonState::Pressed {
         if let Some((window, _surface, _location)) = hit_test(state, state.pointer_location) {
-            state.space.raise_element(&window, true);
-            state.set_keyboard_focus(Some(&window));
+            let (raise, adopted) = focus_target(state, &window);
+            state.space.raise_element(&raise, true);
+            match adopted {
+                Some(chromium) => state.focus_adopted(&raise, &chromium),
+                None => state.set_keyboard_focus(Some(&raise)),
+            }
         }
     }
     let surface_id = state.pointer_focus_id;
@@ -304,8 +390,12 @@ pub fn touch_down(
     state.note_input_activity();
     let hit = hit_test(state, location);
     if let Some((window, _, _)) = &hit {
-        state.space.raise_element(window, true);
-        state.set_keyboard_focus(Some(window));
+        let (raise, adopted) = focus_target(state, window);
+        state.space.raise_element(&raise, true);
+        match adopted {
+            Some(chromium) => state.focus_adopted(&raise, &chromium),
+            None => state.set_keyboard_focus(Some(&raise)),
+        }
     }
     let focus = hit
         .as_ref()
