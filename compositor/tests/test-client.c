@@ -11,8 +11,15 @@
  * Logs go to /dev/console (the host harness reads the serial stream) and
  * to /tmp/sevyn-m1-client.log. Lines are prefixed with monotonic ms.
  *
- * Build: gcc with wayland-client; xdg-shell protocol sources are generated
- * at build time by wayland-scanner (see v2/image/build-m1-image.sh).
+ * Stage 3: SEVYN_CLIENT_APP_ID / SEVYN_CLIENT_TITLE / SEVYN_CLIENT_LOG
+ * let one binary stand in for two surfaces (Shell + app) with distinct
+ * identities and log files; defaults are the M1 values. The client also
+ * binds wp_presentation when advertised and logs the `presented` event
+ * for the frame its first commit produces (the presentation-time proof).
+ *
+ * Build: gcc with wayland-client; xdg-shell + presentation-time protocol
+ * sources are generated at build time by wayland-scanner (see
+ * v2/image/build-m1-image.sh and compositor/tests/nested-check.sh).
  */
 #define _GNU_SOURCE
 #include <errno.h>
@@ -30,6 +37,33 @@
 #include <unistd.h>
 #include <wayland-client.h>
 #include "xdg-shell-client-protocol.h"
+#include "presentation-time-client-protocol.h"
+
+/* Stage 3: the client takes its identity from the environment so one
+ * binary can stand in for two different surfaces (Shell + app) in the
+ * standalone check. Defaults are the Stage 2 / nested-check values,
+ * so the nested check is unaffected.
+ *   SEVYN_CLIENT_APP_ID   (default "sevyn.m1.test")
+ *   SEVYN_CLIENT_TITLE    (default "sevyn-m1-test")
+ *   SEVYN_CLIENT_LOG      (default "/tmp/sevyn-m1-client.log")
+ * The log path default is kept so the nested check (one client) reads
+ * the same file it always has; the standalone check sets a distinct
+ * path per instance. */
+static const char *client_app_id(void)
+{
+    const char *v = getenv("SEVYN_CLIENT_APP_ID");
+    return (v && *v) ? v : "sevyn.m1.test";
+}
+static const char *client_title(void)
+{
+    const char *v = getenv("SEVYN_CLIENT_TITLE");
+    return (v && *v) ? v : "sevyn-m1-test";
+}
+static const char *client_log_path(void)
+{
+    const char *v = getenv("SEVYN_CLIENT_LOG");
+    return (v && *v) ? v : "/tmp/sevyn-m1-client.log";
+}
 
 #define WIN_W 800
 #define WIN_H 300
@@ -107,6 +141,9 @@ struct app {
     struct wl_seat *seat;
     struct wl_pointer *pointer;
     struct wl_keyboard *keyboard;
+    struct wp_presentation *presentation;
+    struct wp_presentation_feedback *feedback;
+    bool presentation_presented; /* one presented event is the proof */
     struct xdg_wm_base *wm_base;
     struct xdg_surface *xdg_surface;
     struct xdg_toplevel *toplevel;
@@ -158,6 +195,67 @@ static void surface_commit(struct app *app, struct surface *s)
     wl_surface_commit(s->wl);
 }
 
+/* --- presentation-time feedback --- */
+
+/* Stage 3: the client asks for presentation-time feedback on its
+ * toplevel surface and logs the `presented` event. That is the
+ * client-side proof that worker 2's `send_presentation_feedback`
+ * reaches a client: the compositor only sends feedback for a frame
+ * that was actually presented. A `discarded` event is logged too
+ * (the check treats "presented, never discarded" as the pass). The
+ * listener must define every event: libwayland aborts on a NULL
+ * entry for an event the compositor sends (same lesson as
+ * keyboard repeat_info / pointer frame). */
+static void presentation_feedback_presented(
+    void *data, struct wp_presentation_feedback *feedback,
+    uint32_t tv_sec_hi, uint32_t tv_sec_lo, uint32_t tv_nsec,
+    uint32_t refresh, uint32_t seq_hi, uint32_t seq_lo, uint32_t flags)
+{
+    struct app *app = data;
+    (void)feedback;
+    (void)tv_sec_hi;
+    (void)tv_sec_lo;
+    (void)tv_nsec;
+    (void)refresh;
+    (void)flags;
+    app->presentation_presented = true;
+    log_line("PRESENTATION presented seq=%u.%u", seq_hi, seq_lo);
+    wp_presentation_feedback_destroy(feedback);
+    app->feedback = NULL;
+}
+
+static void presentation_feedback_discarded(void *data, struct wp_presentation_feedback *feedback)
+{
+    struct app *app = data;
+    (void)feedback;
+    log_line("PRESENTATION discarded");
+    wp_presentation_feedback_destroy(feedback);
+    app->feedback = NULL;
+}
+
+static void presentation_feedback_sync_output(void *data, struct wp_presentation_feedback *feedback,
+                                              struct wl_output *output)
+{
+    (void)data;
+    (void)feedback;
+    (void)output;
+}
+
+static const struct wp_presentation_feedback_listener presentation_feedback_listener = {
+    .sync_output = presentation_feedback_sync_output,
+    .presented = presentation_feedback_presented,
+    .discarded = presentation_feedback_discarded,
+};
+
+static void request_presentation_feedback(struct app *app)
+{
+    if (!app->presentation || app->feedback)
+        return;
+    app->feedback = wp_presentation_feedback(app->presentation, app->toplevel_surface.wl);
+    if (app->feedback)
+        wp_presentation_feedback_add_listener(app->feedback, &presentation_feedback_listener, app);
+}
+
 /* --- xdg_surface / toplevel --- */
 
 static void xdg_surface_configure(void *data, struct xdg_surface *xdg_surface, uint32_t serial)
@@ -166,11 +264,20 @@ static void xdg_surface_configure(void *data, struct xdg_surface *xdg_surface, u
     xdg_surface_ack_configure(xdg_surface, serial);
     if (!app->configured) {
         app->configured = true;
+        /* Ask for presentation feedback BEFORE the commit: Smithay
+         * stores the request in the surface's pending state and the
+         * commit moves it to current, so the frame this commit
+         * produces is the one the feedback reports on. Requesting
+         * after the commit would leave it pending until the NEXT
+         * commit — and this client rarely commits twice. */
+        request_presentation_feedback(app);
         surface_commit(app, &app->toplevel_surface);
         surface_commit(app, &app->left);
         surface_commit(app, &app->right);
-        log_line("M1CLIENT READY surfaces=A(left) B(right) size=%dx%d", WIN_W, WIN_H);
+        log_line("M1CLIENT READY surfaces=A(left) B(right) size=%dx%d app_id=%s", WIN_W, WIN_H,
+                 client_app_id());
     } else {
+        request_presentation_feedback(app);
         surface_commit(app, &app->toplevel_surface);
         surface_commit(app, &app->left);
         surface_commit(app, &app->right);
@@ -424,6 +531,10 @@ static void registry_global(void *data, struct wl_registry *registry, uint32_t n
     } else if (strcmp(interface, xdg_wm_base_interface.name) == 0) {
         app->wm_base = wl_registry_bind(registry, name, &xdg_wm_base_interface, 1);
         xdg_wm_base_add_listener(app->wm_base, &wm_base_listener, app);
+    } else if (strcmp(interface, wp_presentation_interface.name) == 0) {
+        /* Optional: the nested compositor advertises it (Stage 3),
+         * but the client must not fail without it. */
+        app->presentation = wl_registry_bind(registry, name, &wp_presentation_interface, 1);
     }
     (void)version;
 }
@@ -444,7 +555,7 @@ int main(void)
 {
     start_ms = now_ms();
     console_fd = open("/dev/console", O_WRONLY | O_NONBLOCK);
-    log_fd = open("/tmp/sevyn-m1-client.log", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    log_fd = open(client_log_path(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
 
     struct app app;
     memset(&app, 0, sizeof(app));
@@ -476,8 +587,8 @@ int main(void)
     xdg_surface_add_listener(app.xdg_surface, &xdg_surface_listener, &app);
     app.toplevel = xdg_surface_get_toplevel(app.xdg_surface);
     xdg_toplevel_add_listener(app.toplevel, &xdg_toplevel_listener, &app);
-    xdg_toplevel_set_title(app.toplevel, "sevyn-m1-test");
-    xdg_toplevel_set_app_id(app.toplevel, "sevyn.m1.test");
+    xdg_toplevel_set_title(app.toplevel, client_title());
+    xdg_toplevel_set_app_id(app.toplevel, client_app_id());
 
     /* Left half (A, dark red) and right half (B, dark blue). */
     app.left = (struct surface){

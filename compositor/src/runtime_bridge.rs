@@ -112,3 +112,267 @@ pub fn associate(association: &SessionAssociation) {
 pub fn disassociate(session: &SessionId, surface_id: u64, reason: &str) {
     marker!("SESSION STOPPED session={session} surface={surface_id} reason={reason}");
 }
+// The bridge socket server: the Unix socket the Runtime talks to.
+// (Moved here from backend.rs in Stage 3 so the standalone backend can
+// serve the same channel; the protocol is unchanged.)
+
+use std::{
+    io::{Read, Write},
+    os::unix::{
+        io::AsRawFd,
+        net::{UnixListener, UnixStream},
+    },
+    path::PathBuf,
+};
+
+use serde::{Deserialize, Serialize};
+
+use crate::{diag, server::GenesisState};
+
+/// The uid of the peer on a Unix socket, via `SO_PEERCRED`. (`std`'s
+/// `peer_cred` is still unstable on this toolchain, so the check is done
+/// with libc directly.)
+fn peer_uid(stream: &UnixStream) -> Option<u32> {
+    let mut cred = libc::ucred {
+        pid: 0,
+        uid: 0,
+        gid: 0,
+    };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    let ret = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            &mut cred as *mut libc::ucred as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    if ret == 0 {
+        Some(cred.uid)
+    } else {
+        None
+    }
+}
+/// One bridge request (one JSON object per line).
+#[derive(Debug, Deserialize)]
+struct BridgeRequest {
+    /// Must equal [`BRIDGE_PROTOCOL_VERSION`].
+    v: u32,
+    op: String,
+    /// The session to act on (required for `close`).
+    session: Option<String>,
+}
+
+/// One bridge response (one JSON object per line).
+#[derive(Debug, Serialize)]
+struct BridgeResponse {
+    v: u32,
+    ok: bool,
+    op: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+impl BridgeResponse {
+    fn ok(op: &str, session: Option<String>) -> Self {
+        Self {
+            v: BRIDGE_PROTOCOL_VERSION,
+            ok: true,
+            op: op.to_string(),
+            session,
+            error: None,
+        }
+    }
+
+    fn err(op: &str, error: &str) -> Self {
+        Self {
+            v: BRIDGE_PROTOCOL_VERSION,
+            ok: false,
+            op: op.to_string(),
+            session: None,
+            error: Some(error.to_string()),
+        }
+    }
+}
+
+/// One connected bridge client, with its buffered input and output.
+struct BridgeConnection {
+    stream: UnixStream,
+    incoming: Vec<u8>,
+    outgoing: Vec<u8>,
+}
+
+/// The bridge socket server. Shared by the nested and standalone
+/// backends (both serve the same Runtime channel).
+pub(crate) struct BridgeServer {
+    listener: UnixListener,
+    connections: Vec<BridgeConnection>,
+    /// The socket path, for removal at shutdown.
+    pub(crate) path: PathBuf,
+}
+
+impl BridgeServer {
+    pub(crate) fn bind(runtime_dir: &std::path::Path) -> std::io::Result<Self> {
+        let path = runtime_dir.join(BRIDGE_SOCKET_NAME);
+        // A stale socket from a crashed run would make bind fail; remove
+        // it first (a live compositor would still hold the file open, so
+        // this only ever removes a dead socket).
+        let _ = std::fs::remove_file(&path);
+        let listener = UnixListener::bind(&path)?;
+        listener.set_nonblocking(true)?;
+        // Mode 0600: only the platform user may talk to the compositor.
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+        Ok(Self {
+            listener,
+            connections: Vec::new(),
+            path,
+        })
+    }
+
+    /// Accept pending connections (same-uid peers only) and serve one
+    /// complete request line per connection per call. Never blocks.
+    /// A duplicated fd for the listener, for calloop sources: the
+    /// standalone backend polls this fd and calls [`Self::poll`] when it
+    /// is readable. (A dup, not a borrow: the event loop owns the source
+    /// while the server lives in the loop data.)
+    pub(crate) fn poll_fd(&self) -> std::io::Result<std::os::unix::io::OwnedFd> {
+        use std::os::unix::io::BorrowedFd;
+        let borrowed = unsafe { BorrowedFd::borrow_raw(self.listener.as_raw_fd()) };
+        borrowed.try_clone_to_owned()
+    }
+
+    /// Accept pending connections (same-uid peers only) and serve one
+    /// complete request line per connection per call. Never blocks.
+    pub(crate) fn poll(&mut self, state: &mut GenesisState) {
+        loop {
+            match self.listener.accept() {
+                Ok((stream, _)) => {
+                    // Trusted channel: the peer must be the same user.
+                    // (Stage 4 adds pid-binding to the known Runtime pid.)
+                    let allowed = peer_uid(&stream)
+                        .map(|uid| uid == unsafe { libc::getuid() })
+                        .unwrap_or(false);
+                    if !allowed {
+                        diag!("bridge: rejected a connection from another uid");
+                        continue;
+                    }
+                    if stream.set_nonblocking(true).is_err() {
+                        continue;
+                    }
+                    if self.connections.len() >= 8 {
+                        diag!("bridge: too many connections, dropping one");
+                        continue;
+                    }
+                    self.connections.push(BridgeConnection {
+                        stream,
+                        incoming: Vec::new(),
+                        outgoing: Vec::new(),
+                    });
+                }
+                Err(ref err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(_) => break,
+            }
+        }
+
+        let mut index = 0;
+        while index < self.connections.len() {
+            let mut drop_connection = false;
+            let mut response: Option<BridgeResponse> = None;
+            {
+                let connection = &mut self.connections[index];
+                // Flush pending output first.
+                if !connection.outgoing.is_empty() {
+                    match connection.stream.write(&connection.outgoing) {
+                        Ok(written) => {
+                            connection.outgoing.drain(..written);
+                        }
+                        Err(ref err) if err.kind() == std::io::ErrorKind::WouldBlock => {}
+                        Err(_) => drop_connection = true,
+                    }
+                }
+                // Read what is available.
+                if !drop_connection {
+                    let mut chunk = [0u8; 4096];
+                    loop {
+                        match connection.stream.read(&mut chunk) {
+                            Ok(0) => {
+                                drop_connection = true;
+                                break;
+                            }
+                            Ok(read) => {
+                                connection.incoming.extend_from_slice(&chunk[..read]);
+                                if connection.incoming.len() > 4096 {
+                                    drop_connection = true;
+                                    break;
+                                }
+                            }
+                            Err(ref err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                                break;
+                            }
+                            Err(ref err) if err.kind() == std::io::ErrorKind::Interrupted => {
+                                continue;
+                            }
+                            Err(_) => {
+                                drop_connection = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+                // One complete line is one request.
+                if !drop_connection {
+                    if let Some(newline) = connection.incoming.iter().position(|b| *b == b'\n') {
+                        let line: Vec<u8> = connection.incoming.drain(..=newline).collect();
+                        response = Some(handle_bridge_request(state, &line));
+                    }
+                }
+            }
+            if let Some(response) = response {
+                let mut bytes = serde_json::to_vec(&response).unwrap_or_default();
+                bytes.push(b'\n');
+                self.connections[index].outgoing.extend_from_slice(&bytes);
+            }
+            if drop_connection {
+                self.connections.remove(index);
+            } else {
+                index += 1;
+            }
+        }
+    }
+}
+
+/// Handle one bridge request line. `close` is the Shell asking the
+/// compositor to close an application (ADR-0006 milestone 9); `ping` is
+/// the liveness check.
+fn handle_bridge_request(state: &mut GenesisState, line: &[u8]) -> BridgeResponse {
+    let request: BridgeRequest = match serde_json::from_slice(line) {
+        Ok(request) => request,
+        Err(_) => return BridgeResponse::err("(unparsed)", "invalid JSON"),
+    };
+    if request.v != BRIDGE_PROTOCOL_VERSION {
+        return BridgeResponse::err(&request.op, "unsupported protocol version");
+    }
+    match request.op.as_str() {
+        "ping" => BridgeResponse::ok("ping", None),
+        "close" => {
+            let Some(session) = request.session else {
+                return BridgeResponse::err("close", "missing session");
+            };
+            let Some(record) = state
+                .registry
+                .by_session(&SessionId(session.clone()))
+                .map(|record| record.id)
+            else {
+                return BridgeResponse::err("close", "unknown session");
+            };
+            state.close_surface(record);
+            state.needs_redraw = true;
+            BridgeResponse::ok("close", Some(session))
+        }
+        _ => BridgeResponse::err(&request.op, "unknown op"),
+    }
+}

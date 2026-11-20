@@ -19,27 +19,54 @@
 
 use std::sync::{Arc, Mutex};
 
+use calloop::EventLoop;
 use smithay::{
-    delegate_compositor, delegate_output, delegate_seat, delegate_shm, delegate_xdg_shell,
-    desktop::{PopupManager, Space, Window},
-    input::{Seat, SeatHandler, SeatState},
+    backend::renderer::element::memory::MemoryRenderBuffer,
+    delegate_compositor, delegate_content_type, delegate_cursor_shape, delegate_dmabuf,
+    delegate_idle_inhibit, delegate_idle_notify, delegate_layer_shell, delegate_output,
+    delegate_presentation, delegate_seat, delegate_shm, delegate_single_pixel_buffer,
+    delegate_viewporter, delegate_xdg_activation, delegate_xdg_shell,
+    desktop::{layer_map_for_output, LayerSurface, PopupManager, Space, Window, WindowSurfaceType},
+    input::{
+        pointer::{CursorIcon, CursorImageStatus, CursorImageSurfaceData},
+        touch::TouchHandle,
+        Seat, SeatHandler, SeatState,
+    },
     reexports::wayland_server::{
         backend::{ClientData, ClientId, DisconnectReason},
-        protocol::{wl_buffer::WlBuffer, wl_surface::WlSurface},
+        protocol::{wl_buffer::WlBuffer, wl_output::WlOutput, wl_surface::WlSurface},
         Client, DisplayHandle, Resource,
     },
-    utils::{Logical, Point, Serial, Size},
+    utils::{Logical, Physical, Point, Serial, Size, Transform},
     wayland::{
         buffer::BufferHandler,
         compositor::{with_states, CompositorClientState, CompositorHandler, CompositorState},
+        content_type::ContentTypeState,
+        cursor_shape::CursorShapeManagerState,
+        dmabuf::{DmabufGlobal, DmabufHandler, DmabufState},
+        idle_inhibit::{IdleInhibitHandler, IdleInhibitManagerState},
+        idle_notify::{IdleNotifierHandler, IdleNotifierState},
         output::{OutputHandler, OutputManagerState},
+        presentation::PresentationState,
         seat::WaylandFocus,
-        shell::xdg::XdgShellState,
+        shell::{
+            wlr_layer::{
+                Layer as WlrLayer, LayerSurface as WlrLayerSurface, WlrLayerShellHandler,
+                WlrLayerShellState,
+            },
+            xdg::XdgShellState,
+        },
         shm::{ShmHandler, ShmState},
+        single_pixel_buffer::SinglePixelBufferState,
+        tablet_manager::TabletSeatHandler,
+        viewporter::ViewporterState,
+        xdg_activation::{XdgActivationHandler, XdgActivationState, XdgActivationToken},
     },
 };
 
 use crate::{
+    cursor::build_default_cursor_buffer,
+    drm::DrmRenderer,
     marker, output as output_mod,
     runtime_bridge::{self, SessionId},
     surface_registry::SurfaceRegistry,
@@ -102,12 +129,37 @@ pub struct GenesisState {
     /// break clients that already bound it).
     #[allow(dead_code)]
     pub output_manager_state: OutputManagerState,
+    /// Stage 3 protocol states. Each creates one global at startup and
+    /// is retained for the same reason as `output_manager_state` (see
+    /// `compositor/README.md` for the list and what each one does).
+    /// None of these is read after construction except the idle
+    /// notifier (see `idle.rs`) and the layer shell (see
+    /// `WlrLayerShellHandler` below).
+    #[allow(dead_code)]
+    pub layer_shell_state: WlrLayerShellState,
+    #[allow(dead_code)]
+    pub presentation_state: PresentationState,
+    #[allow(dead_code)]
+    pub viewporter_state: ViewporterState,
+    #[allow(dead_code)]
+    pub content_type_state: ContentTypeState,
+    #[allow(dead_code)]
+    pub single_pixel_buffer_state: SinglePixelBufferState,
+    #[allow(dead_code)]
+    pub xdg_activation_state: XdgActivationState,
+    #[allow(dead_code)]
+    pub idle_inhibit_state: IdleInhibitManagerState,
+    #[allow(dead_code)]
+    pub cursor_shape_state: CursorShapeManagerState,
 
     pub seat: Seat<Self>,
     /// The seat's keyboard handle (created once; Stage 2 has one seat).
     pub keyboard: smithay::input::keyboard::KeyboardHandle<Self>,
     /// The seat's pointer handle.
     pub pointer: smithay::input::pointer::PointerHandle<Self>,
+    /// The seat's touch handle (Stage 3: libinput touch; nested mode
+    /// never delivers touch events, so this stays idle there).
+    pub touch: TouchHandle<Self>,
 
     /// The scene. Genesis owns the render list and positions each
     /// surface's element — that is the adoption mechanism (Stage 4).
@@ -116,9 +168,54 @@ pub struct GenesisState {
     pub output: smithay::output::Output,
     /// The output size in logical pixels (== physical at scale 1).
     pub output_size: Size<i32, Logical>,
+    /// The integer output scale (1 in nested mode; `--scale` standalone).
+    /// Logical size = transformed physical size / scale.
+    pub output_scale: i32,
+    /// The output transform in effect (Normal in nested mode; the
+    /// `--rotate` value in standalone mode). Absolute input coordinates
+    /// are mapped through this (see `input.rs`).
+    pub output_transform: Transform,
+    /// The output's physical mode size, before scale/transform. Absolute
+    /// input devices report in this space.
+    pub output_physical_size: Size<i32, Physical>,
 
     pub popup_manager: PopupManager,
     pub registry: SurfaceRegistry,
+
+    /// The dmabuf protocol state. Always present; the `zwp_linux_dmabuf_v1`
+    /// global itself is only created by the standalone backend (see
+    /// `drm.rs`), so nested mode advertises no dmabuf global.
+    pub dmabuf_state: DmabufState,
+    /// The advertised dmabuf global, if any. Kept alive while advertised:
+    /// dropping it would unadvertise the global from live clients.
+    pub dmabuf_global: Option<DmabufGlobal>,
+    /// The standalone backend's active renderer (GLES primary, Pixman
+    /// fallback), if any. Lives here — not in the backend — so the
+    /// dmabuf handler can import client dmabufs into it. `None` in
+    /// nested mode, where no dmabuf global exists and imports fail.
+    pub drm_renderer: Option<DrmRenderer>,
+    /// The client-set cursor surface and its hotspot, if a client set
+    /// one (`wl_pointer.set_cursor`). The standalone backend renders it
+    /// at the pointer location (hardware cursor plane when it fits, GL
+    /// compositing otherwise). `None` means no client cursor: named
+    /// cursors (`cursor-shape`) carry no buffer, and hidden means hidden
+    /// — in the named case the built-in default arrow is drawn instead
+    /// (see `cursor_named` / `default_cursor` below).
+    pub cursor_surface: Option<(WlSurface, Point<i32, Logical>)>,
+    /// The named cursor shape last requested via `cursor-shape`, if
+    /// any (`CursorImageStatus::Named`). Every named shape renders as
+    /// the same built-in arrow — there is no cursor theme system (see
+    /// `cursor.rs`); this is recorded so the choice is visible, not
+    /// so the renderer can vary by it.
+    pub cursor_named: Option<CursorIcon>,
+    /// True when the client hid the cursor (`CursorImageStatus::Hidden`):
+    /// no cursor element at all is drawn, not even the default arrow.
+    pub cursor_hidden: bool,
+    /// The built-in default arrow (16x16, see `cursor.rs`), built once
+    /// at startup. Drawn by the standalone backend whenever there is
+    /// no client-set cursor surface and the cursor is not hidden, so
+    /// the pointer is never invisible.
+    pub default_cursor: MemoryRenderBuffer,
 
     /// Serials handed to clients for input/focus events.
     serial_counter: u32,
@@ -135,12 +232,78 @@ pub struct GenesisState {
     /// Monotonic start time, for `wl_surface.frame` callbacks.
     pub start_time: std::time::Instant,
 
+    /// The idle-notifier state (`ext-idle-notify-v1`). Its timers run
+    /// on `idle_loop` (below) — see `idle.rs` for why the notifier
+    /// has its own loop instead of the backends' loops.
+    pub idle_notifier_state: IdleNotifierState<Self>,
+    /// The dedicated calloop loop for the idle-notifier's timers.
+    /// Pumped with a zero timeout on every backend iteration (see
+    /// `idle.rs`, `pump_idle_timers`); it holds no other sources.
+    pub idle_loop: Option<EventLoop<'static, Self>>,
+    /// Surfaces currently holding an idle inhibitor (see `idle.rs`).
+    /// Pruned of dead surfaces on every poll.
+    pub idle_inhibitors: Vec<WlSurface>,
+    /// Last input activity (any pointer/keyboard/touch event), for
+    /// the DPMS idle clock.
+    pub last_activity: std::time::Instant,
+    /// True while the display is powered off for idle. Set when the
+    /// backend applies a DPMS-off transition, cleared when input or
+    /// a new inhibitor requests a wake.
+    pub dpms_off: bool,
+    /// A pending DPMS transition for the backend to apply (`Some(true)`
+    /// = power on, `Some(false)` = power off). Set by input/inhibit
+    /// (wake) and by `poll_idle` (idle); taken exactly once.
+    pub wants_dpms: Option<bool>,
+
     /// Client connect/disconnect events, pushed by `ClientState`.
     pub client_events: Arc<Mutex<Vec<ClientEvent>>>,
 }
 
 impl GenesisState {
     pub fn new(dh: DisplayHandle, output_size: Size<i32, Logical>) -> Self {
+        let output = output_mod::create_output(&dh, output_size);
+        Self::new_inner(
+            dh,
+            output,
+            output_size,
+            1,
+            Transform::Normal,
+            Size::from((output_size.w, output_size.h)),
+        )
+    }
+
+    /// The standalone backend's constructor: the output is the panel's
+    /// native mode at the given integer scale and static rotation.
+    /// `refresh` is the mode's refresh rate in millihertz.
+    pub fn new_standalone(
+        dh: DisplayHandle,
+        logical_size: Size<i32, Logical>,
+        physical_size: Size<i32, Physical>,
+        scale: i32,
+        transform: Transform,
+        physical_mm: Option<(u32, u32)>,
+        refresh: i32,
+    ) -> Self {
+        let output = output_mod::create_output_with(
+            &dh,
+            physical_size,
+            scale,
+            transform,
+            physical_mm,
+            refresh,
+            "Genesis DRM output",
+        );
+        Self::new_inner(dh, output, logical_size, scale, transform, physical_size)
+    }
+
+    fn new_inner(
+        dh: DisplayHandle,
+        output: smithay::output::Output,
+        output_size: Size<i32, Logical>,
+        output_scale: i32,
+        output_transform: Transform,
+        output_physical_size: Size<i32, Physical>,
+    ) -> Self {
         let compositor_state = CompositorState::new::<Self>(&dh);
         let xdg_shell_state = XdgShellState::new::<Self>(&dh);
         let shm_state = ShmState::new::<Self>(&dh, vec![]);
@@ -150,8 +313,27 @@ impl GenesisState {
             .add_keyboard(Default::default(), 200, 200)
             .expect("seat keyboard");
         let pointer = seat.add_pointer();
+        let touch = seat.add_touch();
         let output_manager_state = OutputManagerState::new_with_xdg_output::<Self>(&dh);
-        let output = output_mod::create_output(&dh, output_size);
+
+        // Stage 3 protocol globals (see COMPOSITOR_PLAN.md, "Fully
+        // equipped"). Each `new` creates its global on the display.
+        let layer_shell_state = WlrLayerShellState::new::<Self>(&dh);
+        let presentation_state = PresentationState::new::<Self>(&dh, libc::CLOCK_MONOTONIC as u32);
+        let viewporter_state = ViewporterState::new::<Self>(&dh);
+        let content_type_state = ContentTypeState::new::<Self>(&dh);
+        let single_pixel_buffer_state = SinglePixelBufferState::new::<Self>(&dh);
+        let xdg_activation_state = XdgActivationState::new::<Self>(&dh);
+        let idle_inhibit_state = IdleInhibitManagerState::new::<Self>(&dh);
+        let cursor_shape_state = CursorShapeManagerState::new::<Self>(&dh);
+        // The idle-notifier's timers need a `LoopHandle<'static, Self>`,
+        // which neither backend's loop can supply (standalone's loop is
+        // `EventLoop<StandaloneLoop>`, nested has no calloop loop), so
+        // the notifier gets a dedicated loop, pumped every iteration —
+        // see `idle.rs`.
+        let idle_loop: EventLoop<'static, Self> =
+            EventLoop::try_new().expect("idle event loop: cannot create epoll instance");
+        let idle_notifier_state = IdleNotifierState::new(&dh, idle_loop.handle());
 
         let mut space = Space::default();
         space.map_output(&output, (0, 0));
@@ -163,14 +345,33 @@ impl GenesisState {
             shm_state,
             seat_state,
             output_manager_state,
+            layer_shell_state,
+            presentation_state,
+            viewporter_state,
+            content_type_state,
+            single_pixel_buffer_state,
+            xdg_activation_state,
+            idle_inhibit_state,
+            cursor_shape_state,
             seat,
             keyboard,
             pointer,
+            touch,
             space,
             output,
             output_size,
+            output_scale,
+            output_transform,
+            output_physical_size,
             popup_manager: PopupManager::default(),
             registry: SurfaceRegistry::new(),
+            dmabuf_state: DmabufState::new(),
+            dmabuf_global: None,
+            drm_renderer: None,
+            cursor_surface: None,
+            cursor_named: None,
+            cursor_hidden: false,
+            default_cursor: build_default_cursor_buffer(),
             serial_counter: 1,
             pointer_location: (0.0, 0.0).into(),
             pointer_focus_id: None,
@@ -178,6 +379,12 @@ impl GenesisState {
             needs_redraw: true,
             frames_presented: 0,
             start_time: std::time::Instant::now(),
+            idle_notifier_state,
+            idle_loop: Some(idle_loop),
+            idle_inhibitors: Vec::new(),
+            last_activity: std::time::Instant::now(),
+            dpms_off: false,
+            wants_dpms: None,
             client_events: Arc::new(Mutex::new(Vec::new())),
         }
     }
@@ -410,6 +617,37 @@ impl BufferHandler for GenesisState {
     fn buffer_destroyed(&mut self, _buffer: &WlBuffer) {}
 }
 
+impl DmabufHandler for GenesisState {
+    fn dmabuf_state(&mut self) -> &mut DmabufState {
+        &mut self.dmabuf_state
+    }
+
+    /// A client imported a dmabuf: import it into the standalone
+    /// backend's active renderer so it can be sampled later. With no
+    /// standalone renderer (nested mode, or before the DRM device is
+    /// up) the import fails — clients then fall back to SHM, the same
+    /// path the nested check already proves. A failed import here is
+    /// per-buffer, never fatal to the compositor.
+    fn dmabuf_imported(
+        &mut self,
+        _global: &DmabufGlobal,
+        dmabuf: smithay::backend::allocator::dmabuf::Dmabuf,
+        notifier: smithay::wayland::dmabuf::ImportNotifier,
+    ) {
+        let imported = match self.drm_renderer.as_mut() {
+            Some(renderer) => renderer.import_dmabuf(&dmabuf).is_ok(),
+            None => false,
+        };
+        if imported {
+            let _ = notifier.successful::<Self>();
+        } else {
+            notifier.failed();
+        }
+    }
+}
+
+delegate_dmabuf!(GenesisState);
+
 impl CompositorHandler for GenesisState {
     fn compositor_state(&mut self) -> &mut CompositorState {
         &mut self.compositor_state
@@ -429,6 +667,11 @@ impl CompositorHandler for GenesisState {
         for window in self.space.elements() {
             window.on_commit();
         }
+        // A layer surface's commit can change its size/anchors, which
+        // changes its arranged geometry in the LayerMap. Re-arranging
+        // on every commit is cheap (it walks the mapped layers, usually
+        // none) and keeps the map correct without a separate hook.
+        layer_map_for_output(&self.output).arrange();
         self.needs_redraw = true;
     }
 }
@@ -466,11 +709,157 @@ impl SeatHandler for GenesisState {
     fn cursor_image(
         &mut self,
         _seat: &Seat<Self>,
-        _image: smithay::input::pointer::CursorImageStatus,
+        image: smithay::input::pointer::CursorImageStatus,
     ) {
         // Nested mode: the parent compositor draws the cursor over our
-        // window. A compositor-owned cursor (hardware cursor plane, GL
-        // fallback, cursor-shape protocol) is Stage 3.
+        // window, so this is only read by the standalone backend. A
+        // surface cursor is stored with its hotspot; a named cursor
+        // (`cursor-shape`) carries no buffer, so it clears the surface
+        // and is recorded — the standalone backend then draws the
+        // built-in default arrow for it (every named shape renders as
+        // the same arrow; there is no cursor theme system, see
+        // `cursor.rs`). Hidden clears both: nothing is drawn at all.
+        match image {
+            CursorImageStatus::Surface(surface) => {
+                let hotspot = with_states(&surface, |states| {
+                    states
+                        .data_map
+                        .get::<CursorImageSurfaceData>()
+                        .and_then(|attributes| attributes.lock().ok())
+                        .map(|attributes| attributes.hotspot)
+                        .unwrap_or_default()
+                });
+                self.cursor_surface = Some((surface, hotspot));
+                self.cursor_named = None;
+                self.cursor_hidden = false;
+            }
+            CursorImageStatus::Named(icon) => {
+                self.cursor_surface = None;
+                self.cursor_named = Some(icon);
+                self.cursor_hidden = false;
+            }
+            CursorImageStatus::Hidden => {
+                self.cursor_surface = None;
+                self.cursor_named = None;
+                self.cursor_hidden = true;
+            }
+        }
+        self.needs_redraw = true;
+    }
+}
+
+impl WlrLayerShellHandler for GenesisState {
+    fn shell_state(&mut self) -> &mut WlrLayerShellState {
+        &mut self.layer_shell_state
+    }
+
+    /// A new layer surface (dock, top bar, panel) was created. It is
+    /// mapped into the output's LayerMap — the scene's
+    /// `render_elements_for_output` already renders mapped layers
+    /// (background/bottom below windows, top/overlay above), so
+    /// mapping is the whole render story — and given an initial
+    /// configure so the client knows how to size itself. The Shell
+    /// migrating its chrome onto layer surfaces is a follow-up (the
+    /// Shell works today with chrome drawn inside its own surface);
+    /// what lands here is the protocol + mapping + rendering.
+    ///
+    /// Known limitation, named not hidden: pointer/keyboard input is
+    /// not yet routed to layer surfaces — `input.rs` hit-tests the
+    /// `Space` (toplevels) only, so a click on a layer surface falls
+    /// through to the toplevel beneath it. Routing input to layers
+    /// lands with the Shell migration.
+    fn new_layer_surface(
+        &mut self,
+        surface: WlrLayerSurface,
+        _output: Option<WlOutput>,
+        layer: WlrLayer,
+        namespace: String,
+    ) {
+        // Single output: the requested output is ignored; every layer
+        // surface lands on the one output.
+        let layer_surface = LayerSurface::new(surface, namespace.clone());
+        let mapped = layer_map_for_output(&self.output)
+            .map_layer(&layer_surface)
+            .is_ok();
+        layer_surface.layer_surface().send_configure();
+        marker!("LAYER SURFACE namespace={namespace} layer={layer:?} mapped={mapped}");
+        self.needs_redraw = true;
+    }
+
+    fn layer_destroyed(&mut self, surface: WlrLayerSurface) {
+        let wl_surface = surface.wl_surface().clone();
+        let existing = layer_map_for_output(&self.output)
+            .layer_for_surface(&wl_surface, WindowSurfaceType::TOPLEVEL)
+            .cloned();
+        if let Some(layer_surface) = existing {
+            let namespace = layer_surface.namespace().to_string();
+            layer_map_for_output(&self.output).unmap_layer(&layer_surface);
+            marker!("LAYER SURFACE DESTROYED namespace={namespace}");
+            self.needs_redraw = true;
+        }
+    }
+}
+
+impl IdleInhibitHandler for GenesisState {
+    fn inhibit(&mut self, surface: WlSurface) {
+        self.add_inhibitor(surface);
+        marker!("IDLE INHIBIT count={}", self.idle_inhibitors.len());
+    }
+
+    fn uninhibit(&mut self, surface: WlSurface) {
+        self.remove_inhibitor(&surface);
+        marker!("IDLE UNINHIBIT count={}", self.idle_inhibitors.len());
+    }
+}
+
+impl IdleNotifierHandler for GenesisState {
+    fn idle_notifier_state(&mut self) -> &mut IdleNotifierState<Self> {
+        &mut self.idle_notifier_state
+    }
+}
+
+// The cursor-shape protocol lets a client request a shape for a
+// tablet tool as well as for the pointer, so Smithay's
+// `delegate_cursor_shape!` requires `TabletSeatHandler`. Genesis has
+// no tablet hardware story and advertises no tablet global — this is
+// the empty implementation (the default `tablet_tool_image` is a
+// no-op), present only so the pointer half of cursor-shape works.
+impl TabletSeatHandler for GenesisState {}
+
+impl XdgActivationHandler for GenesisState {
+    fn activation_state(&mut self) -> &mut XdgActivationState {
+        &mut self.xdg_activation_state
+    }
+
+    /// A client asked to activate a surface (focus handoff, e.g. a
+    /// notification click or `xdg-activation` token from another app).
+    /// The surface is raised and given keyboard focus, exactly like a
+    /// pointer press on it (see `input.rs` click-to-focus). Tokens
+    /// are accepted as-is: there is no Shell focus policy yet to
+    /// refuse one, and the default implementation already considers
+    /// every token valid.
+    fn request_activation(
+        &mut self,
+        _token: XdgActivationToken,
+        _token_data: smithay::wayland::xdg_activation::XdgActivationTokenData,
+        surface: WlSurface,
+    ) {
+        let window = self
+            .registry
+            .records()
+            .iter()
+            .find(|record| record.object_id == surface.id())
+            .map(|record| record.window.clone());
+        if let Some(window) = window {
+            self.space.raise_element(&window, true);
+            self.set_keyboard_focus(Some(&window));
+            marker!(
+                "ACTIVATION surface={}",
+                self.keyboard_focus_id
+                    .map(|id| id.to_string())
+                    .unwrap_or_else(|| "(none)".to_string())
+            );
+        }
     }
 }
 
@@ -479,3 +868,12 @@ delegate_shm!(GenesisState);
 delegate_seat!(GenesisState);
 delegate_output!(GenesisState);
 delegate_xdg_shell!(GenesisState);
+delegate_layer_shell!(GenesisState);
+delegate_presentation!(GenesisState);
+delegate_viewporter!(GenesisState);
+delegate_content_type!(GenesisState);
+delegate_single_pixel_buffer!(GenesisState);
+delegate_xdg_activation!(GenesisState);
+delegate_idle_inhibit!(GenesisState);
+delegate_idle_notify!(GenesisState);
+delegate_cursor_shape!(GenesisState);

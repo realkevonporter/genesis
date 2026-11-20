@@ -24,23 +24,47 @@ path = "src/main.rs"
 #                       relies on).
 #   renderer_gl       — the GLES renderer used by the winit backend.
 #
-# NOT enabled in Stage 2 (each arrives with its stage, per the plan):
-#   backend_drm / backend_libinput / backend_udev / backend_session —
-#       Stage 3 (standalone: DRM/KMS, libinput, session). Enabling them
-#       would also pull libseat/libgbm/libinput system libraries that the
-#       nested compositor never uses.
+# Stage 3 (standalone) adds:
+#   backend_drm       — DRM/KMS: DrmDevice, DrmSurface, DrmCompositor.
+#   backend_gbm       — GBM: the allocator behind the DRM swapchain, the
+#                       EGL-on-GBM display, and the framebuffer exporter.
+#                       (Required by backend::drm::compositor itself: the
+#                       module is gated on backend_gbm, not backend_drm.)
+#   backend_libinput  — libinput pointer/keyboard/touch input.
+#   backend_udev      — udev device discovery (which DRM nodes exist).
+#   backend_session   — the session trait (open devices, VT switch).
+#   backend_session_libseat — the libseat implementation of that trait.
+#                       (`backend_session` alone is only the trait; the
+#                       libseat backend is the separate feature that pulls
+#                       the libseat system library.)
+#   renderer_pixman   — the Pixman software renderer: the fallback when
+#                       GLES init fails, or when forced off.
+#
+# NOT enabled (each arrives with its stage, per the plan):
 #   xwayland — never (no X clients on SevynOS).
-#   renderer_pixman — Stage 3 (software fallback, proven with GLES off).
 #   backend_vulkan / renderer_glow — not needed.
 smithay = { version = "0.7", default-features = false, features = [
     "backend_winit",
     "wayland_frontend",
     "desktop",
     "renderer_gl",
+    "backend_drm",
+    "backend_gbm",
+    "backend_libinput",
+    "backend_udev",
+    "backend_session",
+    "backend_session_libseat",
+    "renderer_pixman",
 ] }
 # Signal handling only (SIGTERM/SIGINT → clean shutdown). Already a
 # transitive dependency via Smithay; listed directly so the use is explicit.
 libc = "0.2"
+# Calloop event loop + signal sources for the standalone backend.
+# Smithay re-exports calloop 0.14 but does not enable its `signals`
+# feature (non-default), so the standalone backend depends on calloop
+# directly with it; feature unification makes it the same locked
+# 0.14.5 crate Smithay uses.
+calloop = { version = "0.14", features = ["signals"] }
 # Bridge socket messages (newline-delimited JSON, protocol version 1).
 # Already in the lockfile as transitive dependencies; listed directly.
 serde = { version = "1", features = ["derive"] }
