@@ -87,7 +87,11 @@ cleanup() {
         fi
     done
     # The client is started by path; match that exact path only.
-    pkill -x sevyn-test-client 2>/dev/null || true
+    # (NB: pgrep/pkill -x cannot match it — "sevyn-test-client" is 17
+    # chars, longer than the kernel's 15-char comm — so match the full
+    # command line, with the bracket trick so pkill cannot match the
+    # shell running this cleanup.)
+    pkill -f "sevyn-test-clien[t]" 2>/dev/null || true
     sleep 1
     for pid_file in "$WORK"/xvfb.pid "$WORK"/weston.pid "$WORK"/compositor.pid; do
         if [ -f "$pid_file" ]; then
@@ -126,17 +130,26 @@ command -v wayland-scanner >/dev/null || fail "wayland-scanner not found"
 # --- Build the test client -----------------------------------------------
 # xdg-shell.xml comes from the installed wayland-protocols package; fall
 # back to the copy vendored in the wayland-protocols crate source (the
-# sandbox/CI may not have the -dev package installed).
+# sandbox/CI may not have the -dev package installed). The client also
+# needs presentation-time.xml (Stage 3: it logs the `presented` event);
+# same lookup for both.
 XDG_SHELL_XML="/usr/share/wayland-protocols/stable/xdg-shell/xdg-shell.xml"
+PRESENTATION_XML="/usr/share/wayland-protocols/stable/presentation-time/presentation-time.xml"
 if [ ! -f "$XDG_SHELL_XML" ]; then
     XDG_SHELL_XML="$(ls ~/.cargo/registry/src/*/wayland-protocols-*/protocols/stable/xdg-shell/xdg-shell.xml 2>/dev/null | head -1)"
+    PRESENTATION_XML="$(ls ~/.cargo/registry/src/*/wayland-protocols-*/protocols/stable/presentation-time/presentation-time.xml 2>/dev/null | head -1)"
 fi
 [ -n "$XDG_SHELL_XML" ] && [ -f "$XDG_SHELL_XML" ] || fail "xdg-shell.xml not found"
+[ -n "$PRESENTATION_XML" ] && [ -f "$PRESENTATION_XML" ] || fail "presentation-time.xml not found"
 wayland-scanner client-header "$XDG_SHELL_XML" "$WORK/xdg-shell-client-protocol.h" \
     || fail "wayland-scanner client-header failed"
 wayland-scanner private-code "$XDG_SHELL_XML" "$WORK/xdg-shell-protocol.c" \
     || fail "wayland-scanner private-code failed"
-gcc -o "$WORK/sevyn-test-client" "$CLIENT_SRC" "$WORK/xdg-shell-protocol.c" \
+wayland-scanner client-header "$PRESENTATION_XML" "$WORK/presentation-time-client-protocol.h" \
+    || fail "wayland-scanner presentation client-header failed"
+wayland-scanner private-code "$PRESENTATION_XML" "$WORK/presentation-time-protocol.c" \
+    || fail "wayland-scanner presentation private-code failed"
+gcc -o "$WORK/sevyn-test-client" "$CLIENT_SRC" "$WORK/xdg-shell-protocol.c" "$WORK/presentation-time-protocol.c" \
     -I"$WORK" $(pkg-config --cflags --libs wayland-client) \
     || fail "test client build failed"
 
@@ -176,6 +189,10 @@ assert_marker "SEVYN SESSION ASSOCIATED session=runtime:"
 assert_marker "SEVYN SURFACE METADATA id=1 app_id=sevyn.m1.test title=sevyn-m1-test"
 assert_marker "SEVYN SURFACE COMMITTED id=1 size=800x300"
 assert_marker "SEVYN FOCUS KEYBOARD surface=1"
+# Presentation-time feedback reaches the client (Stage 3): the client
+# asked for feedback on its first commit and got a `presented` event.
+grep -q "PRESENTATION presented" "$CLIENT_HARDCODED_LOG" \
+    || fail "client never got presentation-time feedback (PRESENTATION presented)"
 
 # --- Input: pointer sweep, click, key --------------------------------------
 # Sweep the pointer across the output; the client must report entering one
@@ -254,7 +271,7 @@ wait "$COMPOSITOR_PID"
 COMPOSITOR_STATUS=$?
 [ "$COMPOSITOR_STATUS" -eq 0 ] || fail "compositor exited with status $COMPOSITOR_STATUS, not 0"
 assert_marker "SEVYN SHUTDOWN clean"
-if pgrep -x sevyn-test-client >/dev/null 2>&1; then
+if pgrep -f "sevyn-test-clien[t]" >/dev/null 2>&1; then
     fail "test client processes remain after compositor shutdown"
 fi
 if pgrep -f "sevyn-compositor --socket sevyn-nested-test" >/dev/null 2>&1; then

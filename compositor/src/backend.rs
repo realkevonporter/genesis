@@ -39,11 +39,6 @@
 //! survives the compositor's exit.
 
 use std::{
-    io::{Read, Write},
-    os::unix::{
-        io::AsRawFd,
-        net::{UnixListener, UnixStream},
-    },
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -52,38 +47,25 @@ use std::{
     time::Duration,
 };
 
-use serde::{Deserialize, Serialize};
 use smithay::{
     backend::{
-        renderer::{
-            element::{
-                surface::{render_elements_from_surface_tree, WaylandSurfaceRenderElement},
-                Kind,
-            },
-            gles::GlesRenderer,
-            utils::draw_render_elements,
-            Color32F, Frame, Renderer,
-        },
+        renderer::{gles::GlesRenderer, utils::draw_render_elements, Color32F, Frame, Renderer},
         winit::{self, WinitEvent, WinitGraphicsBackend},
     },
-    desktop::PopupManager,
     output::Mode,
     reexports::{
-        wayland_server::{protocol::wl_surface::WlSurface, Display, ListeningSocket},
+        wayland_server::{Display, ListeningSocket},
         winit::{
             dpi::LogicalSize, platform::pump_events::PumpStatus, window::Window as WinitWindow,
         },
     },
-    utils::{Logical, Physical, Point, Rectangle, Size, Transform},
-    wayland::{
-        compositor::{with_surface_tree_downward, SurfaceAttributes, TraversalAction},
-        seat::WaylandFocus,
-    },
+    utils::{Logical, Physical, Rectangle, Size, Transform},
 };
 
 use crate::{
     diag, input, marker,
-    runtime_bridge::{BRIDGE_PROTOCOL_VERSION, BRIDGE_SOCKET_NAME},
+    render::{popup_elements, send_frames, send_presentation_feedback},
+    runtime_bridge::BridgeServer,
     server::{ClientEvent, ClientState, GenesisState},
 };
 
@@ -93,264 +75,6 @@ static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn on_signal(_signal: libc::c_int) {
     SHUTDOWN_REQUESTED.store(true, Ordering::SeqCst);
-}
-
-/// The uid of the peer on a Unix socket, via `SO_PEERCRED`. (`std`'s
-/// `peer_cred` is still unstable on this toolchain, so the check is done
-/// with libc directly.)
-fn peer_uid(stream: &UnixStream) -> Option<u32> {
-    let mut cred = libc::ucred {
-        pid: 0,
-        uid: 0,
-        gid: 0,
-    };
-    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
-    let ret = unsafe {
-        libc::getsockopt(
-            stream.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_PEERCRED,
-            &mut cred as *mut libc::ucred as *mut libc::c_void,
-            &mut len,
-        )
-    };
-    if ret == 0 {
-        Some(cred.uid)
-    } else {
-        None
-    }
-}
-/// One bridge request (one JSON object per line).
-#[derive(Debug, Deserialize)]
-struct BridgeRequest {
-    /// Must equal [`BRIDGE_PROTOCOL_VERSION`].
-    v: u32,
-    op: String,
-    /// The session to act on (required for `close`).
-    session: Option<String>,
-}
-
-/// One bridge response (one JSON object per line).
-#[derive(Debug, Serialize)]
-struct BridgeResponse {
-    v: u32,
-    ok: bool,
-    op: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    session: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    error: Option<String>,
-}
-
-impl BridgeResponse {
-    fn ok(op: &str, session: Option<String>) -> Self {
-        Self {
-            v: BRIDGE_PROTOCOL_VERSION,
-            ok: true,
-            op: op.to_string(),
-            session,
-            error: None,
-        }
-    }
-
-    fn err(op: &str, error: &str) -> Self {
-        Self {
-            v: BRIDGE_PROTOCOL_VERSION,
-            ok: false,
-            op: op.to_string(),
-            session: None,
-            error: Some(error.to_string()),
-        }
-    }
-}
-
-/// One connected bridge client, with its buffered input and output.
-struct BridgeConnection {
-    stream: UnixStream,
-    incoming: Vec<u8>,
-    outgoing: Vec<u8>,
-}
-
-/// The bridge socket server.
-struct BridgeServer {
-    listener: UnixListener,
-    connections: Vec<BridgeConnection>,
-    /// The socket path, for removal at shutdown.
-    path: PathBuf,
-}
-
-impl BridgeServer {
-    fn bind(runtime_dir: &std::path::Path) -> std::io::Result<Self> {
-        let path = runtime_dir.join(BRIDGE_SOCKET_NAME);
-        // A stale socket from a crashed run would make bind fail; remove
-        // it first (a live compositor would still hold the file open, so
-        // this only ever removes a dead socket).
-        let _ = std::fs::remove_file(&path);
-        let listener = UnixListener::bind(&path)?;
-        listener.set_nonblocking(true)?;
-        // Mode 0600: only the platform user may talk to the compositor.
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
-        Ok(Self {
-            listener,
-            connections: Vec::new(),
-            path,
-        })
-    }
-
-    /// Accept pending connections (same-uid peers only) and serve one
-    /// complete request line per connection per call. Never blocks.
-    fn poll(&mut self, state: &mut GenesisState) {
-        loop {
-            match self.listener.accept() {
-                Ok((stream, _)) => {
-                    // Trusted channel: the peer must be the same user.
-                    // (Stage 4 adds pid-binding to the known Runtime pid.)
-                    let allowed = peer_uid(&stream)
-                        .map(|uid| uid == unsafe { libc::getuid() })
-                        .unwrap_or(false);
-                    if !allowed {
-                        diag!("bridge: rejected a connection from another uid");
-                        continue;
-                    }
-                    if stream.set_nonblocking(true).is_err() {
-                        continue;
-                    }
-                    if self.connections.len() >= 8 {
-                        diag!("bridge: too many connections, dropping one");
-                        continue;
-                    }
-                    self.connections.push(BridgeConnection {
-                        stream,
-                        incoming: Vec::new(),
-                        outgoing: Vec::new(),
-                    });
-                }
-                Err(ref err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
-                Err(_) => break,
-            }
-        }
-
-        let mut index = 0;
-        while index < self.connections.len() {
-            let mut drop_connection = false;
-            let mut response: Option<BridgeResponse> = None;
-            {
-                let connection = &mut self.connections[index];
-                // Flush pending output first.
-                if !connection.outgoing.is_empty() {
-                    match connection.stream.write(&connection.outgoing) {
-                        Ok(written) => {
-                            connection.outgoing.drain(..written);
-                        }
-                        Err(ref err) if err.kind() == std::io::ErrorKind::WouldBlock => {}
-                        Err(_) => drop_connection = true,
-                    }
-                }
-                // Read what is available.
-                if !drop_connection {
-                    let mut chunk = [0u8; 4096];
-                    loop {
-                        match connection.stream.read(&mut chunk) {
-                            Ok(0) => {
-                                drop_connection = true;
-                                break;
-                            }
-                            Ok(read) => {
-                                connection.incoming.extend_from_slice(&chunk[..read]);
-                                if connection.incoming.len() > 4096 {
-                                    drop_connection = true;
-                                    break;
-                                }
-                            }
-                            Err(ref err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                                break;
-                            }
-                            Err(ref err) if err.kind() == std::io::ErrorKind::Interrupted => {
-                                continue;
-                            }
-                            Err(_) => {
-                                drop_connection = true;
-                                break;
-                            }
-                        }
-                    }
-                }
-                // One complete line is one request.
-                if !drop_connection {
-                    if let Some(newline) = connection.incoming.iter().position(|b| *b == b'\n') {
-                        let line: Vec<u8> = connection.incoming.drain(..=newline).collect();
-                        response = Some(handle_bridge_request(state, &line));
-                    }
-                }
-            }
-            if let Some(response) = response {
-                let mut bytes = serde_json::to_vec(&response).unwrap_or_default();
-                bytes.push(b'\n');
-                self.connections[index].outgoing.extend_from_slice(&bytes);
-            }
-            if drop_connection {
-                self.connections.remove(index);
-            } else {
-                index += 1;
-            }
-        }
-    }
-}
-
-/// Handle one bridge request line. `close` is the Shell asking the
-/// compositor to close an application (ADR-0006 milestone 9); `ping` is
-/// the liveness check.
-fn handle_bridge_request(state: &mut GenesisState, line: &[u8]) -> BridgeResponse {
-    let request: BridgeRequest = match serde_json::from_slice(line) {
-        Ok(request) => request,
-        Err(_) => return BridgeResponse::err("(unparsed)", "invalid JSON"),
-    };
-    if request.v != BRIDGE_PROTOCOL_VERSION {
-        return BridgeResponse::err(&request.op, "unsupported protocol version");
-    }
-    match request.op.as_str() {
-        "ping" => BridgeResponse::ok("ping", None),
-        "close" => {
-            let Some(session) = request.session else {
-                return BridgeResponse::err("close", "missing session");
-            };
-            let Some(record) = state
-                .registry
-                .by_session(&crate::runtime_bridge::SessionId(session.clone()))
-                .map(|record| record.id)
-            else {
-                return BridgeResponse::err("close", "unknown session");
-            };
-            state.close_surface(record);
-            state.needs_redraw = true;
-            BridgeResponse::ok("close", Some(session))
-        }
-        _ => BridgeResponse::err(&request.op, "unknown op"),
-    }
-}
-
-/// Send `wl_surface.frame` callbacks for a surface tree (copied from
-/// Smithay's `minimal` example: the compositor must send frame callbacks
-/// after presenting, or clients stall waiting for the next frame).
-fn send_frames_surface_tree(surface: &WlSurface, time: u32) {
-    with_surface_tree_downward(
-        surface,
-        (),
-        |_, _, &()| TraversalAction::DoChildren(()),
-        |_surface, states, &()| {
-            for callback in states
-                .cached_state
-                .get::<SurfaceAttributes>()
-                .current()
-                .frame_callbacks
-                .drain(..)
-            {
-                callback.done(time);
-            }
-        },
-        |_, _, &()| true,
-    );
 }
 
 /// Present one frame: render the scene into the winit window, send frame
@@ -370,28 +94,7 @@ fn render(
             state
                 .space
                 .render_elements_for_output(renderer, &state.output, 1.0)?;
-
-        // Popups render above their parent toplevel.
-        let mut popup_elements: Vec<WaylandSurfaceRenderElement<GlesRenderer>> = Vec::new();
-        for window in state.space.elements() {
-            let Some(window_location) = state.space.element_location(window) else {
-                continue;
-            };
-            let Some(wl_surface) = window.wl_surface() else {
-                continue;
-            };
-            for (popup, popup_location) in PopupManager::popups_for_surface(&wl_surface) {
-                let location = window_location + popup_location;
-                popup_elements.extend(render_elements_from_surface_tree(
-                    renderer,
-                    popup.wl_surface(),
-                    Point::<i32, Physical>::from((location.x, location.y)),
-                    1.0,
-                    1.0,
-                    Kind::Unspecified,
-                ));
-            }
-        }
+        let popup_elements = popup_elements(state, renderer, 1.0);
 
         let mut frame = renderer.render(&mut framebuffer, size, Transform::Flipped180)?;
         frame.clear(Color32F::new(0.05, 0.05, 0.08, 1.0), &[damage])?;
@@ -401,12 +104,14 @@ fn render(
     }
 
     let time = state.start_time.elapsed().as_millis() as u32;
-    for surface in state.xdg_shell_state.toplevel_surfaces() {
-        send_frames_surface_tree(surface.wl_surface(), time);
-    }
+    send_frames(state, time);
 
     // The parent compositor does the vsync for us.
     backend.submit(Some(&[damage]))?;
+
+    // Presentation-time feedback for surfaces that asked for it (only
+    // for a frame that was actually submitted).
+    send_presentation_feedback(state);
 
     if state.frames_presented == 0 {
         marker!("FIRST FRAME PRESENTED size={}x{}", size.w, size.h);
@@ -539,6 +244,21 @@ pub fn run(
         state.drain_client_events();
         state.reconcile_surfaces();
         bridge.poll(&mut state);
+
+        // Idle: pump the notifier's timers and log DPMS transitions.
+        // Nested mode owns no panel, so a transition is a no-op that
+        // is logged once (the parent compositor owns DPMS); the state
+        // still tracks idle/wake so the markers stay truthful.
+        state.pump_idle_timers();
+        match state.poll_idle() {
+            Some(false) => {
+                diag!("idle: display would power off (nested mode: DPMS is a no-op)")
+            }
+            Some(true) => {
+                diag!("input: display wake (nested mode: DPMS is a no-op)")
+            }
+            None => {}
+        }
 
         if state.needs_redraw {
             if let Err(err) = render(&mut state, &mut backend) {

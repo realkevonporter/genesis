@@ -43,6 +43,7 @@ jobs:
             libinput-dev \
             libgbm-dev \
             libseat-dev \
+            libpixman-1-dev \
             wayland-protocols \
             weston \
             xvfb \
@@ -60,7 +61,9 @@ jobs:
         run: |
           wayland-scanner client-header /usr/share/wayland-protocols/stable/xdg-shell/xdg-shell.xml /tmp/xdg-shell-client-protocol.h
           wayland-scanner private-code /usr/share/wayland-protocols/stable/xdg-shell/xdg-shell.xml /tmp/xdg-shell-protocol.c
-          gcc -o /tmp/sevyn-test-client compositor/tests/test-client.c /tmp/xdg-shell-protocol.c -I/tmp $(pkg-config --cflags --libs wayland-client)
+          wayland-scanner client-header /usr/share/wayland-protocols/stable/presentation-time/presentation-time.xml /tmp/presentation-time-client-protocol.h
+          wayland-scanner private-code /usr/share/wayland-protocols/stable/presentation-time/presentation-time.xml /tmp/presentation-time-protocol.c
+          gcc -o /tmp/sevyn-test-client compositor/tests/test-client.c /tmp/xdg-shell-protocol.c /tmp/presentation-time-protocol.c -I/tmp $(pkg-config --cflags --libs wayland-client)
       # The Stage 2 nested check: boots the compositor under headless
       # Weston, connects the real test client, and asserts the nested
       # milestone markers (output created, surface accepted + associated,

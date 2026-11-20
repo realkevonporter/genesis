@@ -1,29 +1,57 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! `sevyn-compositor` — the Genesis compositor (Stage 2: minimal nested).
+//! `sevyn-compositor` — the Genesis compositor.
 //!
-//! Runs nested inside a parent Wayland compositor (Weston during
-//! development) via Smithay's winit backend, serving one output, `wl_shm`,
-//! `wl_output`, `wl_seat` (pointer + keyboard), and `xdg-shell` to its
-//! clients. See `COMPOSITOR_PLAN.md` (Stage 2) and `compositor/README.md`.
+//! Stage 2 (nested, the default): runs inside a parent Wayland
+//! compositor (Weston during development) via Smithay's winit backend,
+//! serving one output, `wl_shm`, `wl_output`, `wl_seat` (pointer +
+//! keyboard), and `xdg-shell` to its clients.
+//!
+//! Stage 3 (standalone, `--standalone`): runs without a parent
+//! compositor — DRM/KMS output at the panel's native mode, libinput
+//! devices through the libseat session, GLES rendering with a Pixman
+//! fallback. See `COMPOSITOR_PLAN.md` (Stage 3), `compositor/README.md`,
+//! and `src/drm.rs`.
 //!
 //! Usage:
 //!
 //! ```text
 //! sevyn-compositor [--socket <name>] [--size <WIDTHxHEIGHT>]
+//! sevyn-compositor --standalone [--socket <name>] [--scale N]
+//!     [--rotate 0|90|180|270] [--no-gles]
 //! ```
 //!
 //! * `--socket` — the Wayland socket name in `$XDG_RUNTIME_DIR`
 //!   (default `sevyn-compositor`). Clients connect with
 //!   `WAYLAND_DISPLAY=<name>`.
-//! * `--size` — the output size in logical pixels (default `1280x800`).
+//! * `--size` — nested mode only: the output size in logical pixels
+//!   (default `1280x800`). Ignored in standalone mode, which uses the
+//!   output's native mode.
+//! * `--standalone` — run the DRM/KMS backend instead of the nested
+//!   winit backend. Needs a DRM device and a libseat session (a VT
+//!   session under logind/seatd); without one it fails cleanly with a
+//!   named error, exit 1.
+//! * `--scale N` — standalone only: integer output scale (default 1).
+//! * `--rotate DEG` — standalone only: static output rotation,
+//!   0/90/180/270 (default 0).
+//! * `--no-gles` — standalone only: skip the GLES renderer and use the
+//!   Pixman software renderer. `SEVYN_NO_GLES=1` does the same.
 //!
 //! Milestone markers go to stdout (`SEVYN ...` lines); diagnostics go to
-//! stderr. SIGTERM / SIGINT shuts down cleanly (exit 0).
+//! stderr. Both are also appended to `/tmp/genesis.log` (truncated on
+//! start; see `logging.rs` and `compositor/RECOVERY.md`). A panic emits
+//! a `SEVYN CRASH ...` marker and unwinds, which drops the backend
+//! state and releases DRM master. SIGTERM / SIGINT shuts down cleanly
+//! (exit 0). Exit codes: 0 clean shutdown, 1 fatal startup/runtime
+//! failure (including DRM output lost), 2 usage error, 101 panic.
 
 mod backend;
+mod cursor;
+mod drm;
+mod idle;
 mod input;
 mod logging;
 mod output;
+mod render;
 mod runtime_bridge;
 mod server;
 mod surface_registry;
@@ -33,8 +61,10 @@ use std::process::ExitCode;
 
 use smithay::utils::{Logical, Size};
 
+use drm::StandaloneConfig;
+
 fn usage() -> &'static str {
-    "usage: sevyn-compositor [--socket <name>] [--size <WIDTHxHEIGHT>]"
+    "usage: sevyn-compositor [--socket <name>] [--size <WIDTHxHEIGHT>]\n       sevyn-compositor --standalone [--socket <name>] [--scale N] [--rotate 0|90|180|270] [--no-gles]"
 }
 
 fn parse_size(text: &str) -> Result<Size<i32, Logical>, String> {
@@ -54,8 +84,15 @@ fn parse_size(text: &str) -> Result<Size<i32, Logical>, String> {
 }
 
 fn main() -> ExitCode {
+    logging::init_logging();
+    logging::install_panic_hook();
     let mut socket_name = "sevyn-compositor".to_string();
     let mut output_size = Size::from((1280, 800));
+    let mut standalone = false;
+    let mut scale = 1;
+    let mut rotate = smithay::utils::Transform::Normal;
+    let mut no_gles = false;
+    let mut size_given = false;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -64,37 +101,91 @@ fn main() -> ExitCode {
                 println!("{}", usage());
                 return ExitCode::SUCCESS;
             }
+            "--standalone" => {
+                standalone = true;
+            }
+            "--no-gles" => {
+                no_gles = true;
+            }
             "--socket" => {
                 socket_name = args.next().unwrap_or_else(|| {
-                    eprintln!("sevyn-compositor: --socket needs a value");
+                    diag!("--socket needs a value");
                     std::process::exit(2);
                 });
             }
             "--size" => {
                 let text = args.next().unwrap_or_else(|| {
-                    eprintln!("sevyn-compositor: --size needs a value");
+                    diag!("--size needs a value");
                     std::process::exit(2);
                 });
                 match parse_size(&text) {
-                    Ok(size) => output_size = size,
+                    Ok(size) => {
+                        output_size = size;
+                        size_given = true;
+                    }
                     Err(err) => {
-                        eprintln!("sevyn-compositor: {err}");
+                        diag!("{err}");
+                        return ExitCode::from(2);
+                    }
+                }
+            }
+            "--scale" => {
+                let text = args.next().unwrap_or_else(|| {
+                    diag!("--scale needs a value");
+                    std::process::exit(2);
+                });
+                match drm::parse_scale(&text) {
+                    Ok(parsed) => scale = parsed,
+                    Err(err) => {
+                        diag!("{err}");
+                        return ExitCode::from(2);
+                    }
+                }
+            }
+            "--rotate" => {
+                let text = args.next().unwrap_or_else(|| {
+                    diag!("--rotate needs a value");
+                    std::process::exit(2);
+                });
+                match drm::parse_rotate(&text) {
+                    Ok(parsed) => rotate = parsed,
+                    Err(err) => {
+                        diag!("{err}");
                         return ExitCode::from(2);
                     }
                 }
             }
             other => {
-                eprintln!("sevyn-compositor: unknown argument {other:?}\n{}", usage());
+                diag!("unknown argument {other:?}\n{}", usage());
                 return ExitCode::from(2);
             }
         }
     }
 
-    match backend::run(&socket_name, output_size) {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(err) => {
-            eprintln!("sevyn-compositor: fatal: {err}");
-            ExitCode::FAILURE
+    if standalone {
+        if size_given {
+            diag!("ignoring --size in standalone mode (the output's native mode is used)");
+        }
+        let config = StandaloneConfig {
+            socket_name,
+            scale,
+            rotate,
+            no_gles,
+        };
+        match drm::run_standalone(config) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(err) => {
+                diag!("fatal: {err}");
+                ExitCode::FAILURE
+            }
+        }
+    } else {
+        match backend::run(&socket_name, output_size) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(err) => {
+                diag!("fatal: {err}");
+                ExitCode::FAILURE
+            }
         }
     }
 }

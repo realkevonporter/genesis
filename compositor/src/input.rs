@@ -7,6 +7,23 @@
 //! the compositor-owned scene (`Space<Window>`) and routes them to the
 //! surface actually under the pointer, or to the keyboard-focused surface.
 //!
+//! How input flows standalone (Stage 3): libinput delivers pointer /
+//! keyboard / touch events from the kernel devices; [`dispatch_libinput_event`]
+//! routes them through the *same* hit-test and focus rules. Pointer
+//! motion is relative (deltas accumulate, clamped to the output) or
+//! absolute (transformed from physical panel pixels through
+//! [`physical_to_logical`]); touch follows the pointer rule — down
+//! raises and focuses the touched window, motion/up go to the surface
+//! under the touch point, and every touch event is framed to the client.
+//!
+//! Touch was verified against the pointer rule in Stage 3 (not just
+//! asserted): `touch_down` calls the same [`hit_test`] as
+//! `pointer_button` and raises + click-to-focuses on a hit, `touch_motion`
+//! hit-tests the same way `pointer_motion` does, and a touch on empty
+//! space delivers to no surface — exactly the pointer's empty-space
+//! rule. No fix was needed; the only touch/pointer difference is
+//! deliberate (touch motion never moves *pointer* focus).
+//!
 //! ## Stage 2 focus policy (the default, until the Shell defines its own)
 //!
 //! * A new toplevel takes keyboard focus and is marked `Activated`
@@ -31,23 +48,61 @@ use smithay::{
         input::{
             AbsolutePositionEvent, Axis, AxisRelativeDirection, ButtonState, Event, InputEvent,
             KeyState, KeyboardKeyEvent, Keycode, PointerAxisEvent, PointerButtonEvent,
+            PointerMotionEvent, TouchEvent, TouchSlot,
         },
+        libinput::LibinputInputBackend,
         winit::WinitInput,
     },
     desktop::{Window, WindowSurfaceType},
     input::{
         keyboard::FilterResult,
         pointer::{AxisFrame, ButtonEvent, MotionEvent},
+        touch::{DownEvent, MotionEvent as TouchMotion, UpEvent},
     },
     reexports::wayland_server::protocol::wl_surface::WlSurface,
-    utils::{Logical, Point, Raw, Serial},
+    utils::{Logical, Physical, Point, Raw, Serial, Size, Transform},
 };
 
-use crate::{marker, server::GenesisState};
+use crate::{diag, marker, server::GenesisState};
+
+/// Map a point from an absolute input device's physical output space
+/// (the panel's native pixels, untransformed) into logical compositor
+/// space: apply the output transform, then divide by the integer scale.
+///
+/// The transform direction is the inverse of the render transform
+/// (the renderer maps logical → physical with `transform.invert()`),
+/// so physical → logical applies `transform` itself. Pure function,
+/// unit-tested below.
+pub(crate) fn physical_to_logical(
+    point: Point<f64, Physical>,
+    physical_size: Size<i32, Physical>,
+    transform: Transform,
+    scale: i32,
+) -> Point<f64, Logical> {
+    let transformed = transform.transform_point_in(point, &physical_size.to_f64());
+    Point::from((transformed.x / scale as f64, transformed.y / scale as f64))
+}
+
+/// Clamp a logical pointer location inside the output.
+fn clamp_to_output(state: &GenesisState, location: Point<f64, Logical>) -> Point<f64, Logical> {
+    Point::from((
+        location.x.clamp(0.0, state.output_size.w as f64),
+        location.y.clamp(0.0, state.output_size.h as f64),
+    ))
+}
 
 /// Hit-test the pointer location against the scene. Returns the window,
-/// the leaf surface under the pointer, and the surface-local point — or
-/// `None` when the pointer is over empty space.
+/// the leaf surface under the pointer, and the leaf surface's origin in
+/// **global compositor space** — or `None` when the pointer is over
+/// empty space.
+///
+/// The global origin is what Smithay's input handles expect:
+/// `PointerHandle::motion` and `TouchHandle::down` both document the
+/// focus point as "the coordinates of [the surface's] origin in the
+/// global compositor space". (`Window::surface_under` returns the
+/// origin in window-local space, so the window's own location is added
+/// here; a window-local origin would silently misroute surface-local
+/// coordinates for any window not at (0, 0).)
 fn hit_test(
     state: &GenesisState,
     location: Point<f64, Logical>,
@@ -55,7 +110,7 @@ fn hit_test(
     let (window, window_location) = state.space.element_under(location)?;
     let window_point = location - window_location.to_f64();
     let (surface, surface_location) = window.surface_under(window_point, WindowSurfaceType::ALL)?;
-    Some((window.clone(), surface, surface_location))
+    Some((window.clone(), surface, window_location + surface_location))
 }
 
 /// Route a pointer motion event: update pointer focus to the leaf surface
@@ -66,6 +121,11 @@ pub fn pointer_motion(
     serial: Serial,
     time: u32,
 ) {
+    // Any input is activity: it resets the DPMS idle clock, tells the
+    // idle-notifier, and wakes the display if it was powered off for
+    // idle (see `idle.rs`). Every routing function below does the same;
+    // these are the choke points for both backends.
+    state.note_input_activity();
     state.pointer_location = location;
     let hit = hit_test(state, location);
     let focus = hit
@@ -111,6 +171,7 @@ pub fn pointer_button(
     serial: Serial,
     time: u32,
 ) {
+    state.note_input_activity();
     if button_state == ButtonState::Pressed {
         if let Some((window, _surface, _location)) = hit_test(state, state.pointer_location) {
             state.space.raise_element(&window, true);
@@ -141,6 +202,7 @@ pub fn pointer_button(
 
 /// Route a pointer axis (scroll) event to the surface under the pointer.
 pub fn pointer_axis(state: &mut GenesisState, horizontal: f64, vertical: f64, time: u32) {
+    state.note_input_activity();
     let pointer = state.pointer.clone();
     pointer.axis(
         state,
@@ -169,6 +231,7 @@ pub fn keyboard_key(
     serial: Serial,
     time: u32,
 ) {
+    state.note_input_activity();
     let focus_id = state.keyboard_focus_id;
     marker!(
         "KEY key={keycode:?} state={} focus={}",
@@ -224,5 +287,248 @@ pub fn dispatch_input_event(state: &mut GenesisState, event: InputEvent<WinitInp
             pointer_axis(state, horizontal, vertical, time);
         }
         _ => {}
+    }
+}
+
+/// Route a touch-down event: same rule as a pointer press — raise the
+/// window under the touch point and move keyboard focus to it
+/// (click-to-focus), then deliver the touch to the leaf surface under
+/// the point. A touch on empty space delivers to no surface.
+pub fn touch_down(
+    state: &mut GenesisState,
+    location: Point<f64, Logical>,
+    slot: TouchSlot,
+    serial: Serial,
+    time: u32,
+) {
+    state.note_input_activity();
+    let hit = hit_test(state, location);
+    if let Some((window, _, _)) = &hit {
+        state.space.raise_element(window, true);
+        state.set_keyboard_focus(Some(window));
+    }
+    let focus = hit
+        .as_ref()
+        .map(|(_window, surface, surface_location)| (surface.clone(), surface_location.to_f64()));
+    marker!(
+        "TOUCH DOWN slot={:?} x={} y={} surface={}",
+        slot,
+        location.x as i32,
+        location.y as i32,
+        hit.as_ref()
+            .and_then(|(window, _, _)| state
+                .registry
+                .records()
+                .iter()
+                .find(|record| record.window == *window)
+                .map(|record| record.id))
+            .map(|id| id.to_string())
+            .unwrap_or_else(|| "(none)".to_string())
+    );
+    let event = DownEvent {
+        slot,
+        location,
+        serial,
+        time,
+    };
+    let touch = state.touch.clone();
+    touch.down(state, focus, &event);
+    touch.frame(state);
+}
+
+/// Route a touch-motion event to the surface under the touch point.
+/// The touch grab owns the slot once it is down, so motion never
+/// re-focuses; the hit-test here only supplies the surface under the
+/// point (and its origin) for the grab's bookkeeping / DnD targets,
+/// as `TouchHandle::motion` documents. The location is the touch
+/// point in logical space.
+pub fn touch_motion(
+    state: &mut GenesisState,
+    location: Point<f64, Logical>,
+    slot: TouchSlot,
+    time: u32,
+) {
+    state.note_input_activity();
+    let focus = hit_test(state, location)
+        .map(|(_window, surface, surface_location)| (surface, surface_location.to_f64()));
+    let event = TouchMotion {
+        slot,
+        location,
+        time,
+    };
+    let touch = state.touch.clone();
+    touch.motion(state, focus, &event);
+    touch.frame(state);
+}
+
+/// Route a touch-up event, then frame the sequence to the client.
+pub fn touch_up(state: &mut GenesisState, slot: TouchSlot, serial: Serial, time: u32) {
+    state.note_input_activity();
+    let event = UpEvent { slot, serial, time };
+    let touch = state.touch.clone();
+    touch.up(state, &event);
+    touch.frame(state);
+}
+
+/// Route a touch-cancel event (the touch sequence is void).
+pub fn touch_cancel(state: &mut GenesisState) {
+    let touch = state.touch.clone();
+    touch.cancel(state);
+}
+
+/// Dispatch one libinput input event into the routing functions above.
+/// This is the standalone backend's input path; it shares the hit-test
+/// and focus policy with the nested winit path — only the event source
+/// and the coordinate spaces differ:
+///
+/// * relative pointer motion arrives as deltas, accumulated onto the
+///   pointer location and clamped to the output;
+/// * absolute pointer motion and touch positions arrive in physical
+///   panel pixels and are mapped through [`physical_to_logical`]
+///   (output transform, then integer scale).
+pub fn dispatch_libinput_event(state: &mut GenesisState, event: InputEvent<LibinputInputBackend>) {
+    match event {
+        InputEvent::Keyboard { event } => {
+            let serial = state.next_serial();
+            keyboard_key(
+                state,
+                event.key_code(),
+                event.state(),
+                serial,
+                event.time_msec(),
+            );
+        }
+        InputEvent::PointerMotion { event } => {
+            let serial = state.next_serial();
+            let delta = event.delta();
+            let location = clamp_to_output(
+                state,
+                state.pointer_location + Point::<f64, Logical>::from((delta.x, delta.y)),
+            );
+            pointer_motion(state, location, serial, event.time_msec());
+        }
+        InputEvent::PointerMotionAbsolute { event } => {
+            let serial = state.next_serial();
+            let physical = Point::<f64, Physical>::from((
+                event.x_transformed(state.output_physical_size.w),
+                event.y_transformed(state.output_physical_size.h),
+            ));
+            let location = clamp_to_output(
+                state,
+                physical_to_logical(
+                    physical,
+                    state.output_physical_size,
+                    state.output_transform,
+                    state.output_scale,
+                ),
+            );
+            pointer_motion(state, location, serial, event.time_msec());
+        }
+        InputEvent::PointerButton { event } => {
+            let serial = state.next_serial();
+            pointer_button(
+                state,
+                event.button_code(),
+                event.state(),
+                serial,
+                event.time_msec(),
+            );
+        }
+        InputEvent::PointerAxis { event } => {
+            let time = event.time_msec();
+            let horizontal = event.amount(Axis::Horizontal).unwrap_or(0.0);
+            let vertical = event.amount(Axis::Vertical).unwrap_or(0.0);
+            pointer_axis(state, horizontal, vertical, time);
+        }
+        InputEvent::TouchDown { event } => {
+            let serial = state.next_serial();
+            let physical = Point::<f64, Physical>::from((
+                event.x_transformed(state.output_physical_size.w),
+                event.y_transformed(state.output_physical_size.h),
+            ));
+            let location = clamp_to_output(
+                state,
+                physical_to_logical(
+                    physical,
+                    state.output_physical_size,
+                    state.output_transform,
+                    state.output_scale,
+                ),
+            );
+            touch_down(state, location, event.slot(), serial, event.time_msec());
+        }
+        InputEvent::TouchMotion { event } => {
+            let physical = Point::<f64, Physical>::from((
+                event.x_transformed(state.output_physical_size.w),
+                event.y_transformed(state.output_physical_size.h),
+            ));
+            let location = clamp_to_output(
+                state,
+                physical_to_logical(
+                    physical,
+                    state.output_physical_size,
+                    state.output_transform,
+                    state.output_scale,
+                ),
+            );
+            touch_motion(state, location, event.slot(), event.time_msec());
+        }
+        InputEvent::TouchUp { event } => {
+            let serial = state.next_serial();
+            touch_up(state, event.slot(), serial, event.time_msec());
+        }
+        InputEvent::TouchCancel { event } => {
+            diag!("touch cancelled slot={:?}", event.slot());
+            touch_cancel(state);
+        }
+        InputEvent::TouchFrame { .. } => {
+            // Touch events are framed immediately after each down/motion/
+            // up above, so a separate frame event has nothing to add.
+        }
+        InputEvent::DeviceAdded { device } => {
+            diag!("input device added: {device:?}");
+        }
+        InputEvent::DeviceRemoved { device } => {
+            diag!("input device removed: {device:?}");
+        }
+        _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use smithay::utils::{Point, Size, Transform};
+
+    #[test]
+    fn physical_to_logical_normal_scale_1() {
+        let size = Size::from((1920, 1080));
+        let point = physical_to_logical(Point::from((960.0, 540.0)), size, Transform::Normal, 1);
+        assert_eq!((point.x as i32, point.y as i32), (960, 540));
+    }
+
+    #[test]
+    fn physical_to_logical_scale_2() {
+        let size = Size::from((1920, 1080));
+        let point = physical_to_logical(Point::from((960.0, 540.0)), size, Transform::Normal, 2);
+        assert_eq!((point.x as i32, point.y as i32), (480, 270));
+    }
+
+    #[test]
+    fn physical_to_logical_rotated_90() {
+        // 1920x1080 panel rotated 90°: logical space is 1080x1920.
+        // The physical top-left corner maps to the logical top-right.
+        let size = Size::from((1920, 1080));
+        let point = physical_to_logical(Point::from((0.0, 0.0)), size, Transform::_90, 1);
+        assert_eq!((point.x as i32, point.y as i32), (1080, 0));
+        let point = physical_to_logical(Point::from((1920.0, 1080.0)), size, Transform::_90, 1);
+        assert_eq!((point.x as i32, point.y as i32), (0, 1920));
+    }
+
+    #[test]
+    fn physical_to_logical_rotated_180() {
+        let size = Size::from((1920, 1080));
+        let point = physical_to_logical(Point::from((0.0, 0.0)), size, Transform::_180, 1);
+        assert_eq!((point.x as i32, point.y as i32), (1920, 1080));
     }
 }
