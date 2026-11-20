@@ -1,6 +1,13 @@
 packages:
   - "model"
 
+# esbuild (via vitest) runs a postinstall script (node install.js, which
+# fetches the platform binary). pnpm 11 refuses to install until the
+# build is approved — without this, `pnpm install --frozen-lockfile`
+# fails with ERR_PNPM_IGNORED_BUILDS. Written by `pnpm approve-builds`.
+allowBuilds:
+  esbuild: true
+
 catalog:
   "@types/node": "^24.13.3"
   "tsx": "^4.0.0"

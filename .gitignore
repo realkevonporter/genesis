@@ -1,4 +1,5 @@
 build/
+compositor/target/
 model/dist/
 model/node_modules/
 node_modules/

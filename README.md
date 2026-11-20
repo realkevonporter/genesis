@@ -7,26 +7,26 @@ runs inside it during development), never a shipping configuration and
 never a product fallback. If Genesis fails, SevynOS fails safe to a
 terminal/recovery environment, not to Weston.
 
-Genesis is a custom Wayland compositor built on
-[wlroots](https://gitlab.freedesktop.org/wlroots/wlroots) (pinned 0.17.1).
-It owns display outputs, surfaces, input routing, focus, window
-placement, and presentation for SevynOS — and it is what makes true
-browser embedding possible: Genesis places Chromium's surface inside the
-Browser app's content rect in its own scene graph, at 60 fps, zero-copy.
-See [COMPOSITOR_PLAN.md](COMPOSITOR_PLAN.md) for the full plan: the staged
-approach, the adoption mechanism, the browser embedding contract, and the
-recovery guarantee.
+Genesis is a custom Wayland compositor built in Rust on
+[Smithay](https://github.com/Smithay/smithay) (pinned 0.7.0) — "Rust
+all the way" (Kevon 2026-11-19). It owns display outputs, surfaces,
+input routing, focus, window placement, and presentation for SevynOS —
+and it is what makes true browser embedding possible: Genesis places
+Chromium's surface inside the Browser app's content rect in its own
+render list, at 60 fps, zero-copy. See [COMPOSITOR_PLAN.md](COMPOSITOR_PLAN.md)
+for the full plan: the staged approach, the adoption mechanism, the
+browser embedding contract, and the recovery guarantee.
 
 ## Layout
 
 ```text
 .
-├── compositor/          # the C wlroots compositor (the product)
-│   ├── include/sevyn/   # SevynOS-owned public headers (Stage 2)
+├── compositor/          # the Rust Smithay compositor (the product)
+│   ├── Cargo.toml       # genesis-compositor, binary sevyn-compositor
+│   ├── Cargo.lock       # committed; builds are --locked
 │   ├── src/             # server (Stage 2)
 │   ├── tests/           # test clients (sevyn-test-client, the M1 client)
-│   ├── protocols/       # SevynOS-owned protocol XML (Stage 4)
-│   └── meson.build
+│   └── protocols/       # SevynOS-owned protocol XML (Stage 4)
 ├── model/               # the TypeScript policy model (spec-as-code + tests)
 │   ├── src/             # scene, display, surface, window, renderer
 │   └── package.json     # @sevynos/graphics (name is historical; see below)
@@ -37,9 +37,13 @@ recovery guarantee.
 ## Status
 
 Seed (2026-11-19): the boundary is set, the model and the test client are
-in, the plan is here. Stage 2 (minimal nested wlroots compositor) is next.
-The compositor is C; the model is TypeScript. Nothing here is a Weston
+in, the plan is here. Stage 2 (minimal nested Smithay compositor) is next.
+The compositor is Rust; the model is TypeScript. Nothing here is a Weston
 fork, libweston, CEF, or a frame transport.
+
+Seed correction (2026-11-19, the Rust decision): the seed first landed
+with a meson/C compositor skeleton; the Rust pick replaced it with the
+cargo/Rust skeleton — no wlroots, no meson, no C compositor sources.
 
 ## The model (`model/`)
 
@@ -47,8 +51,8 @@ fork, libweston, CEF, or a frame transport.
 window/renderer model: `GenesisCompositor`, `GenesisScene` + scene nodes,
 `GenesisDisplay` + display manager/registry/render plans, surface and
 window registries, frame executor/render loop — with its vitest suite.
-It is the executable spec for exactly the concepts the C server must
-implement. The C server is the implementation; the model is the spec and
+It is the executable spec for exactly the concepts the Rust server must
+implement. The Rust server is the implementation; the model is the spec and
 the tests. It is not shipped code in the SevynOS image.
 
 The package keeps its established name, `@sevynos/graphics`: the SevynOS
@@ -67,13 +71,15 @@ pnpm --filter @sevynos/graphics build
 ## The compositor (`compositor/`)
 
 ```sh
-meson setup build compositor
-meson compile -C build
+cargo build --locked --manifest-path compositor/Cargo.toml
 ```
 
-Needs: gcc, pkg-config, libwayland-dev, wayland-protocols, meson, ninja.
-At seed time the only target is `sevyn-test-client` (the M1 test client);
-Stage 2 adds the server. See `compositor/README.md`.
+Needs: Rust stable (pinned by `rust-toolchain.toml`), gcc, pkg-config,
+libwayland-dev, libxkbcommon-dev, libudev-dev, libinput-dev, libgbm-dev,
+libseat-dev, wayland-protocols. At seed time the only targets are the
+`sevyn-compositor` stub binary and `sevyn-test-client` (the M1 test
+client, built with gcc + wayland-scanner); Stage 2 adds the server. See
+`compositor/README.md`.
 
 ## How SevynOS consumes Genesis
 

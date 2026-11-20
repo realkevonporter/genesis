@@ -1,9 +1,9 @@
-# COMPOSITOR_PLAN.md — Genesis: the SevynOS compositor (custom wlroots, true browser embedding)
+# COMPOSITOR_PLAN.md — Genesis: the SevynOS compositor (Smithay/Rust, true browser embedding)
 
-Status: plan (2026-11-19, branch `v2/compositor-plan`).
+Status: plan (2026-11-19, in the genesis repo).
 Ordered by Kevon 2026-11-19 ~06:35 EST ("Build the compositor route —
 custom Genesis with foreign-toplevel"). Build to PR, then stop — no merge.
-Model: **Genesis is the compositor.** The custom wlroots compositor is not
+Model: **Genesis is the compositor.** The custom Smithay compositor is not
 an experiment alongside Weston; it is the SevynOS compositor, and the
 browser embed is its first proof: Chromium's surface placed by Genesis
 inside the Browser app's content rect, as one window, at 60 fps.
@@ -25,12 +25,13 @@ defined here, before any code moves.
 
 ### What moves to `genesis` (decided from the code)
 
-- **The C compositor itself** — the future `v2/compositor/` tree
-  (ADR-0006 Phase 2 layout: `include/`, `src/` with `main`, `server`,
-  `backend`, `output`, `seat`, `input`, `xdg-shell`, `surface-registry`,
-  `runtime-bridge`, `logging`, `protocols/`, `tests/`, `meson.build`)
-  lives in the genesis repo from the start. There is no C server code in
-  sevynos today to move; Stage 2 is written there, not in sevynos.
+- **The Rust compositor itself** — the future `compositor/` Cargo
+  package (`Cargo.toml`, `src/` with `main.rs` + modules: `server`,
+  `backend`, `output`, `seat`, `input`, `xdg_shell`,
+  `surface_registry`, `runtime_bridge`, `logging`, `protocols/`,
+  `tests/`) lives in the genesis repo from the start. There is no
+  compositor server code in sevynos today to move; Stage 2 is written
+  there, not in sevynos.
 - **`v2/compositor/test-client.c`** — the M1 test client (one
   xdg_toplevel window, two same-client subsurfaces, pointer/keyboard
   logging) becomes the genesis repo's first test client. It has no
@@ -77,7 +78,7 @@ defined here, before any code moves.
   the self-contained scene-graph library for `shell/mobile`, "unrelated
   to the Genesis Node.js host process", "Do not import it from host
   code". The shared name is a historical collision the split must not
-  deepen: the new public repo is the wlroots compositor, the mobile
+  deepen: the new public repo is the Smithay compositor, the mobile
   package keeps its name and scope. Renaming either one is a separate
   decision for Kevon, not part of the split.
 - **Plan/history docs** (`BROWSER_PLAN.md`, `GPU_COMPOSITOR_PLAN.md`,
@@ -119,9 +120,9 @@ Why this, and not the alternatives:
   from the tree — the split PR flips the builder and the pin in one
   commit, so the nightly never has a gap.
 - **CI ownership:** the genesis repo's CI owns the model tests (vitest),
-  the C compositor build, the test-client build, and eventually the
-  nested genesis-check. Sevynos CI owns the image + m-checks against the
-  pinned commit.
+  the Rust compositor build (cargo), the test-client build, and
+  eventually the nested genesis-check. Sevynos CI owns the image +
+  m-checks against the pinned commit.
 
 ### Order of work (split first, Stage 2 second)
 
@@ -130,9 +131,13 @@ Why this, and not the alternatives:
 2. **Seed (in `genesis`, this repo's initial commit)** — README +
    LICENSE + CI + moved `graphics/core/` → `model/` + moved
    `v2/compositor/test-client.c` → `compositor/tests/test-client.c`
-   (with SPDX headers) + the meson build + this plan. No C server code
-   yet — the seed is the boundary, the model, and the test client. (The
-   repo was empty, so the seed lands directly on `main`, not via PR.)
+   (with SPDX headers) + the cargo crate skeleton + this plan. No
+   server code yet — the seed is the boundary, the model, and the test
+   client. (The repo was empty, so the seed lands directly on `main`,
+   not via PR.) **Seed correction (Rust decision, 2026-11-19 ~06:57
+   EST):** the seed first landed with a meson/C compositor skeleton;
+   the Rust pick removes it — the seed's CI and layout follow the pick,
+   not the old C/meson assumption.
 3. **Consumption PR (in `sevynos`)** — builder fetches the pinned genesis
    tarball; M1 builder compiles the test client from the fetched tree;
    pin file added; a fetch script materializes `model/` at
@@ -169,6 +174,159 @@ to a terminal/recovery environment (see "Failure without fallback"
 below). "Never a bricked desktop" means a Genesis failure always lands on
 a usable console with the `sevyn` CLI, never a hung black screen.
 
+## Language: Rust — the decision (locked, Kevon 2026-11-19 ~06:57 EST)
+
+**The Genesis compositor is built in Rust. "Rust all the way" (Kevon,
+2026-11-19 ~06:59 EST): Rust end-to-end for the compositor — no C core
+with Rust on top.** This supersedes ADR-0006's "compositor in C" for the
+compositor itself, and it is recorded explicitly here.
+
+### The two Rust routes, evaluated from live sources (2026-11-19)
+
+**(a) Smithay — the pure-Rust Wayland compositor library. PICKED.**
+
+- **Maintenance:** alive and current. Latest stable **0.7.0** (docs.rs,
+  current); the Smithay org's repo was updated Oct 18, 2026. The Feb 2026
+  API audit pins 0.7.0 for new work and notes master has breaking
+  changes — so Genesis pins 0.7.0 and upgrades deliberately.
+- **Production proof:** the only serious Rust Wayland compositor library,
+  and it ships in real desktops — **cosmic-comp** (System76's COSMIC,
+  smithay 0.7.0, DRM/KMS + libinput via smithay, multi-GPU, XWayland),
+  **niri**, **pinnacle**, plus Smithay's own sample compositor **anvil**.
+- **Fit for Genesis:** Smithay provides the building blocks, not a
+  framework — core Wayland protocols, the official extensions, and some
+  wlroots/KDE extensions (docs.rs 0.7.0). What Genesis needs is there:
+  `wayland::compositor` + `wayland::shell::xdg` (surfaces, toplevels),
+  `wayland::seat` (pointer/keyboard input + focus), `wayland::dmabuf`
+  (hardware-accelerated clients, tied to `backend::allocator` — the
+  zero-copy path), `backend::drm` (DRM/KMS, GBM) + `backend::libinput`
+  (Stage 3 standalone), `backend::renderer::gles` (GLES rendering),
+  `desktop::Space` + `RenderElement` (the scene model — Genesis owns
+  the render list and positions each surface's element, which is how
+  adoption places a surface; there is no `wlr_scene` to lean on and
+  none is needed). System deps are the usual C libraries Smithay links,
+  not code Genesis writes: libwayland, libxkbcommon, libudev, libinput,
+  libgbm, libseat.
+- **The foreign-toplevel gap, stated honestly:** Smithay 0.7.0 ships
+  `wayland::foreign_toplevel_list` (the new `ext-foreign-toplevel-
+list-v1`, list-only) but does **not** implement
+  `zwlr_foreign_toplevel_manager_v1` (the wlr control protocol:
+  activate/minimize/maximize/fullscreen/close). That is not a blocker
+  and not a reason to reach for wlroots: the manager global is a small,
+  well-defined protocol implementation Genesis writes on top of
+  `wayland-server`, using the maintained generated types from
+  `wayland-protocols-wlr` (Smithay org, 0.3.x — `foreign_toplevel::v1`,
+  client + server, generated from the wlr-protocols XML; the same types
+  also live in `wayland-protocols` 0.23 as `wlr::unstable::foreign_
+toplevel::v1`). Smithay's whole pattern is State struct + Handler
+  trait + `delegate_*` macro; the manager global follows it. It is a
+  bounded Stage 4 work item, recorded as such — and it is also the
+  reason the plan keeps the protocol's role as listing/control/
+  association, never embedding: the embedding is Genesis's own render
+  list, whatever library draws it.
+- **License:** MIT — GPL-compatible with this repo's GPL-3.0-or-later.
+
+**(b) wlroots via Rust bindings. REJECTED.**
+
+- **There is no maintained safe binding.** `swaywm/wlroots-rs` (the
+  `wlroots` crate) was **archived by its owner Aug 3, 2024** and is
+  read-only; crates.io's last release is 0.2.1, and the newest version
+  listed is 0.4.0 from **March 2019** (Rust 2015). Its own listing
+  says: "This is no longer maintained. As an alternative consider
+  smithay."
+- **Why it died is structural, not a staffing accident.** The
+  maintainer's postmortem (2019): safely wrapping wlroots' ownership
+  model proved unworkable — 11,000 lines of wrapper code covered less
+  than half the API surface, and the result was too confusing to use
+  (Kiwmi tried it and gave up for plain wlroots). Nothing since has
+  revived it.
+- **The only remaining wlroots-in-Rust route is raw unsafe FFI**
+  (bindgen-style `wlroots-sys`), which keeps C at the core and forfeits
+  Rust's safety — the entire point of the language choice, and directly
+  against "Rust all the way". The bar for picking anything with a C
+  core was explicit: it would need a written justification for why pure
+  Rust can't do the job. Pure Rust can (Smithay + the maintained
+  protocol crates above), so no such justification exists.
+
+**Pick: (a) Smithay 0.7.0, pinned.** The compositor is a Rust binary
+crate (`genesis-compositor`, binary `sevyn-compositor`) depending on
+`smithay = "0.7"`, with `Cargo.lock` committed and `--locked` builds.
+Confirmed by Kevon 2026-11-19 ~07:03 EST ("Aren't you gonna use
+Smithay instead of wlroots?" — Yes. Smithay, not wlroots).
+
+### Smithay coverage check — verified from live sources, 2026-11-19
+
+Checked against Smithay 0.7.0 on docs.rs (source read 2026-11-19,
+`src/wayland/mod.rs`, `src/backend/mod.rs`, `src/desktop/mod.rs`)
+before any Stage 2 code. One gap found, with a workaround — nothing
+assumed.
+
+| Genesis need                                                                                                      | Smithay 0.7.0                                                                                                                                                                                                                                     | Verdict                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| ----------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Foreign-toplevel **listing**                                                                                      | `wayland::foreign_toplevel_list` (`ext-foreign-toplevel-list-v1`)                                                                                                                                                                                 | Covered                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| Foreign-toplevel **management** (`zwlr_foreign_toplevel_manager_v1`: activate/minimize/maximize/fullscreen/close) | **Not implemented** — no `foreign_toplevel_manager` module in `wayland/mod.rs`                                                                                                                                                                    | **Gap, with workaround:** Genesis implements the manager global itself on top of `wayland-server`, using the maintained generated types from `wayland-protocols-wlr` (Smithay org; `foreign_toplevel::v1` has both `client` and `server` modules — verified live). Same types also in `wayland-protocols` 0.23 as `wlr::unstable::foreign_toplevel::v1`. Bounded Stage 4 work, not a blocker — and it changes nothing about the plan: the protocol was always listing/control/association, never the embedding. |
+| dmabuf GPU buffer sharing (zero-copy)                                                                             | `wayland::dmabuf` ("support hardware-accelerated clients; tightly linked to `backend::allocator`") + `backend::allocator` (GBM) + `backend::renderer` (GLes2)                                                                                     | Covered. Caveat, from Smithay's own backend docs: even dmabuf clients still require the `wl_drm` infrastructure to be initialized for hardware acceleration — the Stage 4 spike must confirm Chromium's dmabuf buffers actually land as textures, not just that the protocol is advertised.                                                                                                                                                                                                                     |
+| Input (libinput)                                                                                                  | `backend::libinput` (feature `backend_libinput`) + `wayland::seat` (pointer/keyboard, focus)                                                                                                                                                      | Covered                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| DRM/KMS (Stage 3 standalone)                                                                                      | `backend::drm` (feature `backend_drm`: "direct interaction with the graphical physical devices to setup the display pipeline and submit rendered buffers to the monitors") + `backend::session` + `backend::udev` (device discovery, TTY session) | Covered                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| Scene placement (adoption)                                                                                        | `desktop::Space` + `Window` + `render_output` — "A Window on its own has no position. For that it needs to be placed inside a Space."                                                                                                             | Covered — placement is explicit in what Genesis submits, which is the adoption mechanism. No `wlr_scene` equivalent is needed.                                                                                                                                                                                                                                                                                                                                                                                  |
+
+Nothing else Genesis needs in v1 is missing: `wayland::compositor`,
+`wayland::shell::xdg`, `wayland::shm`, `wayland::output`,
+`wayland::presentation`, `drm_lease` / `drm_syncobj` (backend_drm-gated)
+are all in 0.7.0. If Stage 2 finds a need Smithay 0.7.0 genuinely does
+not cover, the Stage 2 agent reports it rather than working around it
+silently — the pin stays 0.7.0 until a deliberate upgrade decision.
+
+### ADR implication
+
+This **amends ADR-0006's selected foundation (wlroots → Smithay)** and
+supersedes its "compositor in C". ADR-0006's own rule for a replacement
+applies: a superseding ADR is written before Stage 2 code lands, and it
+must preserve the SevynOS-owned Runtime, Shell, application, and SDK
+interfaces — which this pick does (the Runtime↔compositor interface is
+unchanged; only the implementation language and library change).
+ADR-0006's original reason for rejecting a Rust compositor framework —
+"introducing Rust, a Rust compositor framework, React Native native
+integration, Wayland, and the Runtime simultaneously" — no longer holds
+the same way: Rust is already in the project (see below), and the RN /
+Wayland / Runtime path is proven through M1–M13. What remains is the
+foundation choice, decided here.
+
+### What the Rust choice means for the build
+
+- **Cargo in the image build + CI.** The builder runs `cargo build
+--release --locked` (toolchain pinned by `rust-toolchain.toml`,
+  stable channel; GitHub runners ship Rust via rustup, and the image
+  builder ensures the same toolchain). System deps installed in CI and
+  the builder: `libwayland-dev`, `libxkbcommon-dev`, `libudev-dev`,
+  `libinput-dev`, `libgbm-dev`, `libseat-dev`, `pkg-config`. The built
+  `sevyn-compositor` binary is staged into the image with its `.so`
+  closure (the same `copy-closure.py` pattern as Weston). `Cargo.lock`
+  is committed — reproducible builds, `--locked` everywhere.
+- **No wlroots, no meson, no C compositor sources.** The
+  `libwlroots-dev` 0.17.1 pin is gone (there is no wlroots at all).
+  The seed's meson/C skeleton is removed, not carried forward — the
+  seed's CI and layout follow this pick (see the seed note in the
+  split section). The C test client stays: it is a _test client_, not
+  the compositor core — a Wayland client proving input routing, built
+  with gcc + wayland-scanner exactly as `build-m1-image.sh` builds it
+  today. Building a C test client does not put C at the core.
+
+### What it means for the boundary with the C++ RN host
+
+Nothing changes, because there is no FFI between them to change: the
+compositor and the RN host are **separate processes talking Wayland** —
+the host speaks the Wayland client protocol, Genesis speaks the Wayland
+server protocol, and the Runtime↔compositor channel is bytes over a
+Unix socket. The language of one side is invisible to the other.
+Rust is not new to the project: the native bridge already is Rust
+(`hosts/linux/native`, `sevyn-wayland-bridge`, `wayland-client`
+0.31.11, `smithay-client-toolkit` 0.19.2 — the _client_ toolkit, a
+different crate from `smithay` the server library — and the quality
+workflow's `native-wayland` job already runs `cargo test --locked`).
+What is new is the compositor itself being Rust — which is the point
+of this decision.
+
 ## The bar (locked)
 
 60 fps on the GF65 (MSI GF65 Thin 9SD, GTX 16-series) once the embed
@@ -182,11 +340,182 @@ already did the desktop. CDP screencast stays dead (15–30 fps, killed
 by the 60 fps bar): the page is proven by pixels in Chromium's own
 buffers, presented by Genesis, never by a screencast frame.
 
+## Fully equipped — the quality bar (locked, Kevon 2026-11-19 ~07:21 EST)
+
+"Make sure that Genesis is fully equipped. Don't cut any corners, it
+should be extremely polished and performant." This is the locked
+"build it the right way regardless of time and difficulty" rule,
+applied to Genesis. It is not a vibe: it is the checklist below, and
+the rule that governs it:
+
+**A stage ships complete or it does not ship.** Every checklist item
+is either delivered by a named stage — with a proof — or named in
+"Explicit follow-ups" with a reason. Nothing is silently omitted, and
+a stage that cannot meet its item properly does not claim it: it says
+so, and the item waits. If a stage misses a performance budget, the
+stage does not ship until the budget is met or the budget is
+explicitly re-scoped by Kevon — no silent slip.
+
+### The checklist
+
+Provenance: every "Smithay ships it" below is verified from Smithay
+0.7.0 on docs.rs (source read 2026-11-19 — see Sources). "Genesis
+implements" means Genesis writes the handler/wiring on top of Smithay;
+"Smithay ships it" alone never counts as delivered.
+
+#### Protocols
+
+| Protocol                                                            | v1?                | Stage | Notes                                                                                                                                                                                                                                                                                                                                   |
+| ------------------------------------------------------------------- | ------------------ | ----- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Core Wayland (`wl_compositor`, `wl_shm`, `wl_output`, `wl_seat`)    | Yes                | 2     | The floor. `wl_seat` covers pointer + keyboard; touch joins in Stage 3.                                                                                                                                                                                                                                                                 |
+| xdg-shell                                                           | Yes                | 2     | Toplevels, popups. The Shell and every app window.                                                                                                                                                                                                                                                                                      |
+| `zwp_linux_dmabuf_v1`                                               | Yes                | 3–4   | The zero-copy path. `wl_drm` init required for hardware acceleration (Smithay's own caveat); the Stage 4 spike proves Chromium's buffers land as textures.                                                                                                                                                                              |
+| `ext-foreign-toplevel-list-v1` + `zwlr_foreign_toplevel_manager_v1` | Yes                | 4     | List side ships in Smithay; the manager global is Genesis-implemented from `wayland-protocols-wlr` types (see "Language: Rust"). Listing/control/association only — never the embedding.                                                                                                                                                |
+| Layer-shell (`wlr-layer-shell`)                                     | Yes                | 3     | Smithay provides it (`desktop::layer`: `LayerSurface`, `LayerMap`). This is how the dock, top bar, and panels become first-class compositor surfaces. The protocol is implemented in Stage 3; the Shell migrating its chrome onto layer surfaces is a Shell follow-up (the Shell works today with chrome drawn inside its own surface). |
+| Presentation-time (`wp_presentation`)                               | Yes                | 3     | Vsync feedback — the measurement behind "no tearing" and the frame-time budget.                                                                                                                                                                                                                                                         |
+| Viewporter, content-type, single-pixel-buffer, xdg-activation       | Yes                | 3     | Small, Smithay-shipped; viewporter + content-type are part of correct surface handling, xdg-activation of focus handoff.                                                                                                                                                                                                                |
+| Idle-inhibit + idle-notify                                          | Yes                | 3     | Moved into v1 by this bar (the plan previously listed "no idle inhibition"). Idle is a polish item, not an afterthought: video playback must inhibit idle, and idle must drive DPMS (see Polish).                                                                                                                                       |
+| Pointer-constraints + relative-pointer                              | Yes                | 4     | Smithay ships both. Pointer lock for embedded fullscreen/pointer-lock clients; handler wiring in Stage 4, not new machinery.                                                                                                                                                                                                            |
+| Data-device clipboard (`wl_data_device`)                            | Yes                | 4     | Smithay's `selection` module. Copy/paste between apps is a v1 need (the Browser needs it); drag-and-drop is the follow-up below.                                                                                                                                                                                                        |
+| Screencopy (`wlr-screencopy`, `ext-image-copy-capture`)             | **No — follow-up** | —     | Smithay 0.7.0 does not implement it: no `screencopy` module. It needs a Genesis implementation on renderer readback, plus a permission story (capture is a privileged capability). Screen capture stays out of v1, as before.                                                                                                           |
+| Input-method + text-input                                           | **No — follow-up** | —     | Smithay ships both, but they are useless without an input-method client: there is no Shell on-screen keyboard or IME UI yet. Follow-up when the Shell has one.                                                                                                                                                                          |
+| Virtual keyboard                                                    | **No — follow-up** | —     | Same reason: needs the Shell keyboard UI.                                                                                                                                                                                                                                                                                               |
+| Tablet                                                              | **No — follow-up** | —     | Smithay ships `tablet_manager`, but there is no tablet hardware story and no Shell consumer yet.                                                                                                                                                                                                                                        |
+| XWayland                                                            | **No**             | —     | No X clients on SevynOS, as before. Smithay ships it behind a feature; Genesis does not enable it.                                                                                                                                                                                                                                      |
+| Fractional scaling                                                  | **No — follow-up** | —     | The protocols exist (`fractional_scale`, `viewporter`) but v1 ships integer output scale only. Fractional scale needs a Shell/Settings scale UI and a test matrix; it is a follow-up, not a silent omission.                                                                                                                            |
+| Global shortcuts                                                    | **No**             | —     | No registration protocol in Smithay (`keyboard_shortcuts_inhibit` is inhibit, not registration). Out, as before.                                                                                                                                                                                                                        |
+| Session lock                                                        | **No — follow-up** | —     | Smithay ships `session_lock`, but the lock-screen UI is a Shell feature that does not exist yet. The protocol is wired when the Shell builds the lock screen.                                                                                                                                                                           |
+| Color management                                                    | **No — follow-up** | —     | No protocol in Smithay 0.7.0 and no Shell story.                                                                                                                                                                                                                                                                                        |
+| Output management UI                                                | **No — follow-up** | —     | Mode setting itself is Stage 3 (single output, native mode); a management UI is a Settings feature, follow-up.                                                                                                                                                                                                                          |
+| Remote desktop                                                      | **No**             | —     | Needs screencopy plus an input-injection story. Out.                                                                                                                                                                                                                                                                                    |
+
+#### Input
+
+| Item                                       | v1?                | Stage | Notes                                                                                                                                                   |
+| ------------------------------------------ | ------------------ | ----- | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Pointer                                    | Yes                | 2–3   | `wayland::seat` + `backend::libinput`. Hit-test routing proven in Stage 2 (nested), re-proven standalone in Stage 3.                                    |
+| Keyboard                                   | Yes                | 2–3   | `wayland::seat` + libxkbcommon. Focus policy is the Shell's (see Window/focus policy).                                                                  |
+| Touch                                      | Yes                | 3     | libinput touch events, routed by the same hit-test rule as pointer. Not a v1 deliverable "beyond not breaking" any more — the bar makes it a real item. |
+| libinput device handling                   | Yes                | 3     | `backend::libinput` + `backend::udev` discovery, `backend::session` for the TTY session.                                                                |
+| Gestures (swipe/pinch, `pointer_gestures`) | **No — follow-up** | —     | Smithay ships the protocol; there is no Shell consumer yet (workspace switching is a Shell decision).                                                   |
+
+#### Outputs
+
+| Item            | v1?                | Stage | Notes                                                                                                                                           |
+| --------------- | ------------------ | ----- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| DRM/KMS         | Yes                | 3     | `backend::drm` + `backend::session` + `backend::udev`. The standalone compositor.                                                               |
+| Mode setting    | Yes                | 3     | Native mode of the GF65 panel, set at startup. Mode switching on hotplug is a follow-up (single fixed output in v1).                            |
+| Multi-output    | **No — follow-up** | —     | `desktop::Space` supports multiple outputs, but second-output policy, arrangement, and testing are follow-up work after single-output is solid. |
+| Scaling / HiDPI | Integer only       | 3     | Integer output scale in v1. Fractional scaling is the follow-up above.                                                                          |
+| Rotation        | Static             | 3     | Output transform (`Transform::_90/180/270`) set at startup. Runtime rotation switching is a Settings follow-up.                                 |
+
+#### Rendering
+
+| Item                     | v1?                  | Stage | Notes                                                                                                                                                                                                                                                                      |
+| ------------------------ | -------------------- | ----- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| GPU dmabuf / EGL primary | Yes                  | 3–5   | Smithay GLES renderer (`backend::renderer::gles`) + `wayland::dmabuf` + GBM allocator. The zero-copy path; the GF65 proof requires it.                                                                                                                                     |
+| Software fallback        | Yes                  | 3     | Smithay ships a Pixman renderer (`backend::renderer::pixman`) — the compositor fallback when GLES init fails — and Mesa llvmpipe runs the same GLES renderer in QEMU/CI. Stage 3 proves the fallback by booting with GLES forced off. There is no third renderer to write. |
+| Damage tracking          | Yes                  | 3     | `backend::renderer::damage` — only damaged regions redraw. Proven by frame-time measurement, not by eyeballing.                                                                                                                                                            |
+| Vsync                    | Yes                  | 3     | DRM page-flip, with presentation-time feedback. No tearing-present path exists.                                                                                                                                                                                            |
+| Direct scanout           | Yes, where available | 5     | `DrmCompositor` hardware composition (overlay planes) scans a fullscreen client buffer out directly where the hardware allows; compositing is always the fallback. Proven by frame time, never assumed.                                                                    |
+| 60 fps bar               | Yes                  | 5     | GF65 proof only (see "The bar"). QEMU cannot prove it.                                                                                                                                                                                                                     |
+
+#### Window / focus policy
+
+The Shell defines the policy; Genesis is the mechanism. Genesis never
+invents window policy of its own — it implements exactly what the
+Shell specifies, through the Runtime↔compositor interface.
+
+| Item                                                                                                   | v1?                | Stage | Notes                                                                                                                                                         |
+| ------------------------------------------------------------------------------------------------------ | ------------------ | ----- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Adoption focus policy (click content → page, click chrome → app; adopted surfaces never self-activate) | Yes                | 4     | The first policy instance, specified in Stage 4. Proven by its own protocol tests, including the hostile cases.                                               |
+| Activation, stacking, minimization                                                                     | Shell-defined      | 4+    | The mechanism (activate/close/minimize via the foreign-toplevel manager) ships in Stage 4; the Shell's policy for when to use it is a Shell decision surface. |
+| Workspaces, always-on-top, tiling                                                                      | **No — follow-up** | —     | No Shell policy exists for these yet. They are named here so they are not silently missing.                                                                   |
+
+#### Polish
+
+| Item                            | v1?             | Stage | Notes                                                                                                                                                                                                                  |
+| ------------------------------- | --------------- | ----- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Smooth animations / transitions | Yes             | 3–5   | The compositor provides damage-driven redraw at vsync + presentation-time feedback; the Shell owns the animation curves. Proven at Stage 5 by sustained 60 fps while scrolling, resizing, and dragging.                |
+| No tearing                      | Yes             | 3–5   | Page-flip only; proven by presentation-time feedback and the GF65 visual check.                                                                                                                                        |
+| Correct cursor handling         | Yes             | 3     | Hardware cursor plane (DRM cursor plane) when available, GL cursor fallback; cursor-shape protocol (`wayland::cursor_shape`) for client-requested shapes.                                                              |
+| Idle / DPMS                     | Yes             | 3     | Idle-notify drives DPMS off via the DRM connector property; any input wakes. Idle-inhibit lets video playback hold the display on.                                                                                     |
+| Session restore                 | Compositor part | 3     | The Runtime records stopped state (ADR-0006 milestone 10); relaunch-on-login is a Shell/Runtime follow-up. The compositor's part is stable session/device handling across a restart — no lost outputs, no stuck seats. |
+
+### Performance budget
+
+These are budgets, not measurements: each stage is measured against
+them, and the measured numbers are recorded at that stage's
+acceptance. A stage that misses a budget does not ship until the
+budget is met or Kevon explicitly re-scopes it.
+
+| Metric                 | Budget                                                                       | Measured at | Proof                                                                     |
+| ---------------------- | ---------------------------------------------------------------------------- | ----------- | ------------------------------------------------------------------------- |
+| Frame time             | p95 ≤ 16.67 ms per frame at 60 Hz (no missed vsync in a 60 s session)        | Stage 5     | GF65: Shell + Browser scrolling + navigation, presentation-time feedback. |
+| Input latency, pointer | Pointer move → cursor update ≤ 1 frame (16.67 ms)                            | Stage 4     | Nested + standalone pointer sweep with timestamps.                        |
+| Input latency, keys    | Key press → visible result ≤ 3 frames (50 ms)                                | Stage 4     | Key-to-photon spot check in the check harness.                            |
+| Memory                 | `sevyn-compositor` steady-state RSS ≤ 200 MB with Shell + one Browser window | Stage 3     | Recorded at acceptance; tightened with data after Stage 3 measures it.    |
+| Startup                | Wayland socket up ≤ 2 s from exec; first presented frame ≤ 3 s               | Stage 3     | GF65 + QEMU boot logs.                                                    |
+
+### Per-stage checklist map
+
+- **Stage 2 (nested):** core protocols, xdg-shell, seat (pointer +
+  keyboard), Runtime session association, clean exit. Nothing else is
+  claimed at Stage 2 — in particular no DRM/KMS, no dmabuf proof, no
+  frame-rate claim.
+- **Stage 3 (standalone):** DRM/KMS + session + udev, mode setting
+  (native mode), integer scale, static rotation, layer-shell,
+  presentation-time + viewporter + content-type + single-pixel-buffer +
+  xdg-activation, idle-inhibit + idle-notify, DPMS, hardware cursor,
+  touch + libinput, GLES renderer + Pixman fallback (proven with GLES
+  forced off), damage tracking, vsync, recovery console, the
+  performance budget's memory + startup numbers recorded.
+- **Stage 4 (adoption):** foreign-toplevel list + manager,
+  pointer-constraints + relative-pointer, data-device clipboard,
+  adoption focus policy, input-latency budgets recorded.
+- **Stage 5 (browser embedding):** dmabuf zero-copy proven on the
+  GF65, direct scanout where available, animations/transitions smooth,
+  no tearing, frame-time budget met at 60 fps — the only proof of the
+  bar.
+
+### Explicit follow-ups
+
+Everything the checklist marks "follow-up" is listed here, once, so
+nothing is silently omitted. None of these blocks any stage; each
+waits on the trigger named.
+
+- **Multi-output** — trigger: a second display needs supporting
+  (hardware or a Shell multi-display design).
+- **Fractional scaling** — trigger: a HiDPI panel or a Shell/Settings
+  scale UI.
+- **Screencopy / screen capture** — trigger: a capture feature with a
+  permission story (needs a Genesis renderer-readback implementation;
+  Smithay 0.7.0 does not provide it).
+- **Input-method, text-input, virtual keyboard** — trigger: a Shell
+  on-screen keyboard / IME UI.
+- **Tablet** — trigger: tablet hardware + a Shell consumer.
+- **Gestures (swipe/pinch)** — trigger: a Shell gesture story
+  (e.g. workspace switching).
+- **Drag-and-drop** — trigger: a Shell gesture/UX story (clipboard
+  ships in v1; drag-and-drop is the same mechanism, a different UX).
+- **Session lock** — trigger: a Shell lock-screen UI (protocol ships
+  in Smithay; Genesis wires it when the Shell builds the screen).
+- **Color management** — trigger: a Shell color story (no protocol in
+  Smithay 0.7.0).
+- **Output management UI** — trigger: a Settings output UI.
+- **Remote desktop** — trigger: a remote-access feature (needs
+  screencopy first).
+- **Workspaces, always-on-top, tiling** — trigger: Shell window
+  policy decisions.
+- **Runtime rotation switching, hotplug mode switching, relaunch-on-
+  login session restore** — trigger: the corresponding Settings /
+  Shell features.
+
 ## Where we are (2026-11-19, main f3ce6739)
 
 - The compositor is Weston (ADR-0006 Stage 1). `v2/compositor/` holds only
-  `test-client.c` (an M1 subsurface test client). No custom wlroots
-  compositor exists yet.
+  `test-client.c` (an M1 subsurface test client). No custom compositor
+  exists yet.
 - M12 Genesis is merged: Weston runs its GL renderer and the RN host
   presents through EGL/GLES2, with the CPU painter as fallback.
 - M13 is in progress (PR #121 is the coordination fix, not embedding):
@@ -225,11 +554,19 @@ buffers, presented by Genesis, never by a screencast frame.
   singleton.
 - **Genesis-only shipping.** No Weston fallback, no runtime compositor
   selection in the shipping image (see "The decision" above).
-- **ADR-0006 stands.** wlroots is the foundation; no Weston fork, no
-  libweston, no from-scratch compositor. Language: C. The compositor
+- **ADR-0006 stands, except as amended by the Rust decision.**
+  Smithay is the foundation (see "Language: Rust"); no Weston fork, no
+  libweston, no from-scratch compositor. Language: Rust. The compositor
   stays independent from the Runtime; the two communicate through a
   narrow, versioned interface. Public platform APIs use SevynOS-owned
-  terminology, never `wlr_*` types.
+  terminology, never `smithay::*` types.
+- **Fully equipped — a stage ships complete or it does not ship.**
+  The checklist in "Fully equipped" is acceptance criteria, not
+  aspiration: every item is delivered by a named stage with a proof,
+  or named in "Explicit follow-ups" with a reason. A stage that cannot
+  meet its item properly says so and does not claim it; a stage that
+  misses a performance budget does not ship until the budget is met or
+  Kevon explicitly re-scopes it.
 
 ## The decisive Wayland facts
 
@@ -263,48 +600,69 @@ resize, reparent, or embed a surface, and no guarantee any request is
 honoured ("There is no guarantee the toplevel will be actually activated").
 
 So, stated plainly: **adoption is compositor-internal scene placement,
-NOT a protocol feature.** Genesis owns the `wlr_scene` graph
-(`wlr_scene_create`, `wlr_scene_tree_create`,
-`wlr_scene_surface_create`, `wlr_scene_subsurface_tree_set_clip`) and
-places any surface's node anywhere in the scene. The foreign-toplevel
-protocol's role is listing, control, and association — the Shell binds
-the manager to know which toplevels exist, to activate/close them, and
-to tell adopted surfaces apart from standalone windows. It is not the
-embedding mechanism, and no client request through it can place a surface.
+NOT a protocol feature.** Genesis owns its render list (Smithay
+`desktop::Space` + `RenderElement`: Genesis submits exactly the elements
+it wants, at the positions it wants) and places any surface's element
+anywhere in the scene. The foreign-toplevel protocol's role is listing,
+control, and association — the Shell binds the manager to know which
+toplevels exist, to activate/close them, and to tell adopted surfaces
+apart from standalone windows. It is not the embedding mechanism, and no
+client request through it can place a surface.
 
 ## Design
 
 ### Foundation and pins
 
-- **wlroots 0.17.1**, pinned. Verified 2026-11-19: `libwlroots-dev`
-  apt candidate on Ubuntu noble is 0.17.1-2.1build1; wayland-client/server
-  1.22.0, wayland-protocols 1.45, weston 13.0.0 (Weston only as the
-  development host compositor for Stage 2 — it is not staged into the
-  standalone shipping image). The pin is recorded in the builder and the
-  workflow; a wlroots upgrade is a deliberate change, not a drift.
-- **Language: C** (ADR-0006). The Shell stays TypeScript/React Native;
-  the boundary is a typed native interface / IPC, never raw wlroots
-  pointers in Shell code.
-- **Layout** (ADR-0006 Phase 2, in the genesis repo — see "The split"):
-  `compositor/` with `include/`, `src/` (`main`, `server`, `backend`,
-  `output`, `seat`, `input`, `xdg-shell`, `surface-registry`,
-  `runtime-bridge`, `logging`), `protocols/`, `tests/`, `meson.build`,
-  `README.md`.
+- **Smithay 0.7.0**, pinned. Verified 2026-11-19: latest stable on
+  docs.rs, production-proven by cosmic-comp (0.7.0), niri, pinnacle,
+  anvil. Master has breaking changes (Feb 2026 audit) — Genesis does
+  not track master. The pin is recorded in `compositor/Cargo.toml` +
+  `Cargo.lock`; a Smithay upgrade is a deliberate change, not a drift.
+  System deps (Smithay links them; Genesis does not write them):
+  libwayland 1.22.0, libxkbcommon, libudev, libinput, libgbm, libseat
+  (Weston 13.0.0 only as the development host compositor for Stage 2 —
+  it is not staged into the standalone shipping image).
+- **Language: Rust** (see "Language: Rust" above). The Shell stays
+  TypeScript/React Native; the boundary is a typed native interface /
+  IPC, never library internals in Shell code.
+- **Layout** (in the genesis repo — see "The split"): `compositor/` is
+  a Cargo package — `Cargo.toml` (`genesis-compositor`, binary
+  `sevyn-compositor`), `src/` (`main.rs` + modules: `server`,
+  `backend`, `output`, `seat`, `input`, `xdg_shell`,
+  `surface_registry`, `runtime_bridge`, `logging`), `tests/` (the C
+  test client), `protocols/` (SevynOS-owned protocol XML), `README.md`.
 - **Protocols in v1:** core Wayland compositor, wl_shm, wl_output, wl_seat
-  (pointer + keyboard), xdg-shell, `zwlr_foreign_toplevel_manager_v1`
-  (Shell only — see below), `zwp_linux_dmabuf_v1` (the zero-copy path).
-  Nothing else is advertised. No Xwayland, no screen capture, no global
-  shortcuts, no virtual keyboard, no tablet protocols, no remote desktop,
-  no session locking, no idle inhibition, no color management, no
-  fractional scaling, no output management UI, no drag and drop.
-- **Renderer:** wlroots GLES2 renderer. Chromium's dmabuf buffers are
-  imported as textures; the RN host keeps presenting through EGL/GLES2
-  exactly as under M12, so the M12 texture path is the model, not a new
-  invention. SHM buffers remain a correctness fallback for clients that
-  submit them (the nested CI check runs on them) — a SHM Chromium is a
-  failed bar, not a pass: the GF65 proof requires the dmabuf path.
+  (pointer + keyboard; touch joins in Stage 3), xdg-shell,
+  `ext-foreign-toplevel-list-v1` (Smithay ships it) +
+  `zwlr_foreign_toplevel_manager_v1` implemented in Genesis from the
+  maintained `wayland-protocols-wlr` generated types (Shell only — see
+  below), `zwp_linux_dmabuf_v1` (the zero-copy path), layer-shell
+  (`wlr-layer-shell`, Smithay `desktop::layer`), presentation-time,
+  viewporter, content-type, single-pixel-buffer, xdg-activation,
+  idle-inhibit + idle-notify, pointer-constraints + relative-pointer,
+  data-device clipboard (`wl_data_device` via Smithay `selection`).
+  The full in/out list with reasons is the checklist in "Fully
+  equipped" — nothing else is advertised in v1. No Xwayland, no screen
+  capture / screencopy, no input-method, no virtual keyboard, no
+  tablet protocols, no global shortcuts, no fractional scaling, no
+  remote desktop, no session locking, no color management, no output
+  management UI, no drag and drop, no multi-output.
+- **Renderer:** Smithay's GLES renderer (`backend::renderer::gles`).
+  Chromium's dmabuf buffers are imported as textures through
+  `wayland::dmabuf` + `backend::allocator`; the RN host keeps presenting
+  through EGL/GLES2 exactly as under M12, so the M12 texture path is the
+  model, not a new invention. SHM buffers remain a correctness fallback
+  for clients that submit them (the nested CI check runs on them) — a SHM
+  Chromium is a failed bar, not a pass: the GF65 proof requires the
+  dmabuf path. The compositor's own software fallback is Smithay's
+  Pixman renderer (`backend::renderer::pixman`), proven in Stage 3 with
+  GLES forced off; damage tracking is `backend::renderer::damage`,
+  vsync is the DRM page-flip with presentation-time feedback, and
+  direct scanout is `DrmCompositor` hardware composition (overlay
+  planes) where the hardware allows, compositing otherwise — see
+  "Fully equipped" for the full rendering checklist and budget.
 
-### Stage 2 — Minimal nested wlroots compositor (ADR-0006)
+### Stage 2 — Minimal nested Smithay compositor (ADR-0006, as amended)
 
 Genesis runs nested inside a Weston session (Weston is the outer
 compositor here — development infrastructure, the same role it plays
@@ -326,7 +684,7 @@ The nested compositor is also where Stages 4–5 are first proven (fast
 iteration, restartable without logging out), before they are re-proven
 standalone.
 
-### Stage 3 — Standalone Genesis compositor (ADR-0006)
+### Stage 3 — Standalone Genesis compositor (ADR-0006, as amended)
 
 Genesis runs without a parent compositor: DRM/KMS output (virtio-gpu in
 QEMU, the GF65 panel on hardware), libinput device input, session
@@ -345,7 +703,18 @@ standalone milestone, verbatim):
 10. Major crashes produce useful logs.
 
 Item 8 is the recovery guarantee — see "Failure without fallback". One
-output only in v1; multi-output is explicitly out of scope.
+output only in v1; multi-output is explicitly out of scope (see
+"Fully equipped" follow-ups).
+
+Stage 3 also delivers its part of the quality checklist (see "Fully
+equipped" — the per-stage map): native mode + integer scale + static
+rotation on the one output; layer-shell; presentation-time,
+viewporter, content-type, single-pixel-buffer, xdg-activation;
+idle-inhibit + idle-notify with DPMS; hardware cursor; touch +
+libinput; the Pixman fallback proven with GLES forced off; damage
+tracking; vsync; and the memory + startup budget numbers recorded.
+A Stage 3 that cannot meet one of those does not ship — the item is
+named, not claimed.
 
 ### Stage 4 — Adoption: the mechanism
 
@@ -402,24 +771,27 @@ for session↔pid association; the compositor enforces it.
 #### Placement, clipping, move/resize
 
 - Genesis keeps a per-Browser-window **adoption record**: the Browser
-  window's `wlr_scene_tree`, the adopted Chromium surface's
-  `wlr_scene_surface` node as a child of that tree, and the content rect
-  (window-local coordinates).
-- The adopted node is positioned at the window's output position plus the
-  rect origin, and **clipped** to the rect with
-  `wlr_scene_subsurface_tree_set_clip` on the Chromium surface's subtree,
-  so Chromium pixels can never paint outside the content area — not over
+  window's position in the `Space`, the adopted Chromium surface's
+  `RenderElement` (placed as a child of the Browser window's element
+  list), and the content rect (window-local coordinates).
+- The adopted element is positioned at the window's output position plus
+  the rect origin, and **clipped** to the rect — Genesis submits only
+  the clipped region of the Chromium element to the render list, so
+  Chromium pixels can never paint outside the content area — not over
   the tab bar, not over the address bar, not over neighbouring windows.
+  (Smithay has no `wlr_scene` equivalent; Genesis owns its render list
+  and the clipping is explicit in what it submits.)
 - **Move:** when the Browser window moves, Genesis repositions the
-  adopted node by the same delta in the same frame — the two can never
-  drift apart, because there is only one scene graph and one output
-  position. This is the fix for M13's drag drift: the pairing is structural,
+  adopted element by the same delta in the same frame — the two can never
+  drift apart, because there is only one scene and one output position.
+  This is the fix for M13's drag drift: the pairing is structural,
   not two windows that happen to sit near each other.
 - **Resize:** when the Browser window resizes, Genesis sends
   `xdg_toplevel.configure` to Chromium with the new content size, and
   Chromium resizes its own surface. This is also the fix for M13's
   missing live resize sync — and it needs no CDP WebSocket client in the
-  C CLI, because the resize is a compositor configure, not a CDP call.
+  Rust compositor, because the resize is a compositor configure, not a
+  CDP call.
 - The adopted Chromium toplevel is **never activated as a standalone
   window** and never appears as a separate dock/taskbar entry: the Shell,
   which binds `zwlr_foreign_toplevel_manager_v1`, hides adopted surfaces
@@ -428,8 +800,8 @@ for session↔pid association; the compositor enforces it.
 
 #### Input routing and focus policy
 
-- **Pointer:** hit-testing is the scene graph's own
-  (`wlr_scene_node_at`): a pointer position inside the content rect
+- **Pointer:** hit-testing is the compositor's own
+  (`Space::element_under`): a pointer position inside the content rect
   hits the adopted Chromium surface; anywhere else in the window it hits
   the Browser chrome surfaces. No coordinate translation layer, no pixel
   geometry in the harness — the compositor routes to the surface actually
@@ -578,10 +950,17 @@ before the standalone compositor becomes the shipping default:
 - No frame transport, no CDP screencast revival, no CEF, no Chromium
   Embedded Framework of any kind.
 - No Weston fork, no libweston, no from-scratch compositor.
-- No multi-output, no Xwayland, no screen capture, no global shortcuts,
-  no virtual keyboard, no tablet protocols, no remote desktop, no session
-  locking, no idle inhibition, no color management, no fractional scaling,
-  no output management UI, no drag and drop.
+- **No C core, no wlroots, no meson.** The compositor is Rust end to
+  end on Smithay (see "Language: Rust"). The only C in the repo is the
+  test client, which is a client, not the compositor.
+- No multi-output, no Xwayland, no screen capture / screencopy, no
+  input-method, no virtual keyboard, no tablet protocols, no global
+  shortcuts, no fractional scaling, no remote desktop, no session
+  locking, no color management, no output management UI, no drag and
+  drop, no gestures. Each of these is named in "Fully equipped" —
+  Explicit follow-ups, with the reason and the trigger — not silently
+  dropped. (Idle inhibition is NOT in this list any more: the quality
+  bar moved idle-inhibit + idle-notify into v1, Stage 3.)
 - No multi-tab. Real multi-tab is the principled follow-up, not this
   work: it needs a WebSocket client in the C CLI driving Page.navigate /
   minimize-restore windows — CDP over HTTP only cannot drive a live tab
@@ -601,11 +980,14 @@ before the standalone compositor becomes the shipping default:
   untouched, so the M13 check keeps proving its own image. The new
   `build-genesis-image.sh` fetches the genesis repo at the pinned commit
   (see "The split" — `v2/image/genesis-pin.txt`, tarball sha256-verified,
-  `SEVYN_GENESIS_SRC` local override) and builds the compositor + test
-  client from the fetched tree; it adds `libwlroots-dev` 0.17.1 (pinned)
-  and its build deps, stages `sevyn-compositor` + the
-  `sevyn-compositor.sock` path, and carries the init change (supervise
-  Genesis; socket-wait timeout → recovery console;
+  `SEVYN_GENESIS_SRC` local override) and builds the compositor with
+  cargo (`cargo build --release --locked`) + the test client with gcc
+  from the fetched tree; it installs the Rust toolchain (rustup, stable,
+  pinned by `rust-toolchain.toml`) and the Smithay system deps
+  (`libwayland-dev`, `libxkbcommon-dev`, `libudev-dev`, `libinput-dev`,
+  `libgbm-dev`, `libseat-dev`, `pkg-config`), stages `sevyn-compositor` +
+  the `sevyn-compositor.sock` path, and carries the init change
+  (supervise Genesis; socket-wait timeout → recovery console;
   `sevyn.recovery=1` → recovery console directly). Weston is staged
   only into the _nested-check_ image variant (Stage 2, where it is the
   outer compositor); the standalone image stages no Weston.
@@ -630,6 +1012,13 @@ before the standalone compositor becomes the shipping default:
 - GF65: 60 fps sustained in the Browser (scrolling, navigation) with the
   dmabuf path active + real-hardware rendering — hardware proof only,
   Kevon's retest.
+- **The fully-equipped checklist is acceptance criteria, not
+  aspiration:** the nightly flips only when Stage 3's checklist items
+  are complete with their proofs recorded AND Stage 5's are — and the
+  performance budget numbers (frame time, input latency, memory,
+  startup) are recorded at their stages. A stage that misses a budget
+  does not ship until the budget is met or Kevon explicitly re-scopes
+  it.
 - CI (`genesis-check.mjs`, forked from the m1/m13 check pattern):
   Genesis-live set (socket up, Shell + app inside, frames flowing);
   adoption geometry (adopted surface inside the host rect, clipped, no
@@ -659,10 +1048,13 @@ before the standalone compositor becomes the shipping default:
   on DRM/KMS (modes, page flips, input devices). Mitigation: every Stage
   4/5 proof is re-run standalone; the nested check is a development
   accelerator, never the acceptance proof.
-- **wlroots API churn:** the scene and foreign-toplevel APIs are
-  `WLR_USE_UNSTABLE`. Mitigation: the 0.17.1 pin, SevynOS-owned types
-  wrapping every wlroots call, and ADR-0006's rule that no public API
-  names a `wlr_*` type.
+- **Smithay API churn:** 0.7.0 is the pinned stable, but master has
+  breaking changes (Feb 2026 audit) and Smithay's APIs are explicitly
+  unstable across minor versions. Mitigation: the 0.7.0 pin +
+  `Cargo.lock` + `--locked` builds, SevynOS-owned types wrapping every
+  Smithay call, and ADR-0006's rule that no public API names a
+  `smithay::*` type. A Smithay upgrade is a deliberate change, never a
+  drift.
 - **Chromium identification assumptions:** the app_id string and the
   dmabuf path are verified at the Stage 4 spike against Chromium 159 as
   launched by `sevyn browser` — if Chromium submits SHM only, the
@@ -686,7 +1078,9 @@ before the standalone compositor becomes the shipping default:
 ## Sources
 
 - `docs/decisions/ADR-0006-genesis-compositor-strategy.md` (stages,
-  milestones, C, wlroots, Runtime↔compositor boundary — read in full).
+  milestones, Runtime↔compositor boundary — read in full; foundation
+  and language as amended by the Rust decision in this plan: Smithay,
+  not wlroots; Rust, not C).
 - `BROWSER_PLAN.md` (decisive Wayland facts, M13 pairing, CDP control
   plane, single-tab by design).
 - `v2/compositor/test-client.c` (same-client subsurface proof, M1).
@@ -701,10 +1095,27 @@ Browser.tsx` (Browser app, CDP driving, 152 px chrome, content rect),
   IPC pattern).
 - Upstream: `wlr-foreign-toplevel-management-unstable-v1.xml` (protocol
   purpose: taskbars/docks; requests: maximize/minimize/fullscreen/
-  activate/close + `set_rectangle` minimize hint; version 2 in wlroots)
-  and `wlr/types/wlr_scene.h` (`wlr_scene_create`,
-  `wlr_scene_tree_create`, `wlr_scene_surface_create`,
-  `wlr_scene_subsurface_tree_set_clip`).
-- Environment (verified 2026-11-19): `libwlroots-dev` apt candidate
-  0.17.1-2.1build1 on Ubuntu noble; wayland 1.22.0, wayland-protocols
-  1.45, weston 13.0.0.
+  activate/close + `set_rectangle` minimize hint; version 2 in wlroots).
+- Smithay 0.7.0, verified from live docs.rs source 2026-11-19:
+  `src/wayland/mod.rs` (`wayland::dmabuf`, `wayland::foreign_toplevel_
+list`, `wayland::seat`, `wayland::shell`, `wayland::shm`,
+  `wayland::output`, `wayland::presentation`; no
+  `foreign_toplevel_manager` module — and no `screencopy` module),
+  `src/backend/mod.rs` (`backend::drm`, `backend::libinput`,
+  `backend::allocator`, `backend::renderer`, `backend::session`,
+  `backend::udev`), `src/desktop/mod.rs` (`desktop::Space`, `Window`,
+  `render_output`, `desktop::layer` — `LayerSurface`, `LayerMap`,
+  layer-shell), `src/backend/renderer/mod.rs` (`renderer::gles`,
+  `renderer::pixman` — the software fallback — `renderer::damage`,
+  `renderer::multigpu`), `src/backend/drm/mod.rs` (`DrmDevice`,
+  `DrmSurface`, `DrmCompositor` hardware composition via planes,
+  cursor + overlay planes, `VrrSupport`). `wayland-protocols-wlr`
+  (`foreign_toplevel::v1`, client + server modules) for the
+  manager-global workaround. `swaywm/wlroots-rs` (archived by owner
+  Aug 3, 2024; "no longer maintained… consider smithay") for the
+  rejected route.
+- Environment (verified 2026-11-19): wayland 1.22.0, wayland-protocols
+  1.45, weston 13.0.0 (development host only); Smithay system deps
+  libwayland-dev, libxkbcommon-dev, libudev-dev, libinput-dev,
+  libgbm-dev, libseat-dev; Rust stable via rustup (cargo/rustc 1.98.1
+  in the sandbox). No `libwlroots-dev` — there is no wlroots.

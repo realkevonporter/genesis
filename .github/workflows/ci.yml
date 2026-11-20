@@ -10,7 +10,12 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+      # No root package.json in this repo (the model is the only package),
+      # so pnpm/action-setup has no packageManager field to read: pin the
+      # version explicitly. Matches sevynos's pnpm@11.17.0 pin.
       - uses: pnpm/action-setup@v4
+        with:
+          version: 11.17.0
       - uses: actions/setup-node@v5
         with:
           node-version: 24
@@ -24,6 +29,8 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+      # GitHub's ubuntu runners ship Rust via rustup; rust-toolchain.toml
+      # pins the stable channel.
       - name: Install compositor build dependencies
         run: |
           sudo apt-get update -qq
@@ -31,17 +38,35 @@ jobs:
             gcc \
             pkg-config \
             libwayland-dev \
-            wayland-protocols \
-            meson \
-            ninja-build
-      - run: meson setup build compositor
-      - run: meson compile -C build
+            libxkbcommon-dev \
+            libudev-dev \
+            libinput-dev \
+            libgbm-dev \
+            libseat-dev \
+            wayland-protocols
+      - name: Build the Rust compositor
+        working-directory: compositor
+        run: cargo build --locked
+      - name: Lint the Rust compositor
+        working-directory: compositor
+        run: cargo clippy --locked -- -D warnings
+      - name: Check Rust formatting
+        working-directory: compositor
+        run: cargo fmt --check
+      - name: Build the C test client
+        run: |
+          wayland-scanner client-header /usr/share/wayland-protocols/stable/xdg-shell/xdg-shell.xml /tmp/xdg-shell-client-protocol.h
+          wayland-scanner private-code /usr/share/wayland-protocols/stable/xdg-shell/xdg-shell.xml /tmp/xdg-shell-protocol.c
+          gcc -o /tmp/sevyn-test-client compositor/tests/test-client.c /tmp/xdg-shell-protocol.c -I/tmp $(pkg-config --cflags --libs wayland-client)
 
   format:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+      # See the model job: no root package.json, so pin pnpm explicitly.
       - uses: pnpm/action-setup@v4
+        with:
+          version: 11.17.0
       - uses: actions/setup-node@v5
         with:
           node-version: 24
