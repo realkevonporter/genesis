@@ -280,3 +280,10 @@ fi
 
 echo "nested-check: PASS — all Stage 2 milestones proven"
 echo "nested-check: output created, surface accepted + associated, input routed, close + clean shutdown, no orphans"
+
+# --- Stage 4 adoption (adoption-check.sh, nested backend) -------------------
+# The Stage 4 harness boots its own parent stack (Xvfb :99 + Weston +
+# nested compositor) and proves the adoption milestones. It fails on a
+# Stage 3 tree by design (no adopt op yet) — see adoption-check.sh.
+compositor/tests/adoption-check.sh || fail "adoption check (nested) failed"
+echo "nested-check: PASS — Stage 4 adoption milestones proven (nested)"

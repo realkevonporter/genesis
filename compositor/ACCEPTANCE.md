@@ -125,3 +125,48 @@ worker 3's standalone run.
   real DRM in QEMU/KVM except the Pixman fallback, which is NOT
   PROVEN on this box's virtual DRM stack (evidence in the check
   script header and `measurements.txt`); GF65 proof is still owed.
+
+## Chromium 159 dmabuf spike (Stage 4, Track 4 — 2026-11-20)
+
+Real Chromium as launched by `sevyn browser`, against the standalone
+compositor on the KVM box (45.77.162.169, QEMU virtio-gpu guest).
+Harness: `compositor/tests/chromium-spike.sh` (three phases per run:
+`--app=about:blank`; same + `--use-gl=angle --use-angle=swiftshader
+--v=1`; no `--app`). Evidence preserved on the box at
+`/root/genesis-stage3-check/last-chromium-spike/` (`verdict.txt`,
+`chromium-1/2/3.log` with `WAYLAND_DEBUG=1`, `compositor.log`).
+
+Verdict: **SHM-ONLY — the zero-copy bar FAILS as measured in the
+QEMU guest; Stage 5 must know before it is built.**
+
+- Chromium: **159.0.8150.0** (CDP `/json/version` reachable in all
+  three phases).
+- **app_id is `chromium-browser` in all three phases** — the plan's
+  assumed `chromium` is wrong for Chromium 159 as launched by
+  `sevyn browser`, with or without `--app`. The adoption track must
+  match on the Runtime-declared pid, never on the app_id string
+  (the harness's A3 spoof case proves exactly that).
+- Chromium binds `zwp_linux_dmabuf_v1` (v4) and reads the format
+  table + tranche, but **creates zero dmabuf buffers in every phase**
+  (`dmabuf_buffer_creates=0`, `dmabuf_bind=1`) and presents frames
+  on SHM buffers only (`shm_buffer_creates=4` per phase). The
+  compositor committed the surface (e.g. `SEVYN SURFACE COMMITTED
+  id=1 size=1018x738`), so the SHM path renders — it is the
+  zero-copy path that does not happen.
+- Whether the cause is the guest's software GL (llvmpipe) or the
+  compositor's dmabuf feedback is **not established** by this spike:
+  the GPU process made no Wayland connection of its own, and the
+  `--v=1` phase-2 log carries no decisive GL/ANGLE fallback line
+  (only binding-version warnings). A GF65 run (real GPU) is the test
+  that would settle it; until then, Stage 5 must be built assuming
+  SHM fallback is possible, not assuming dmabuf textures.
+- The spike itself took six runs to land (v1–v6): v1's verdict logic
+  was wrong (launcher-pid aliveness, `@` vs `#` object ids); v2/v3
+  died because `pkill -f` matched the launcher's own command line
+  (the launch line re-introduces the literal chrome path — fixed
+  with `pkill -x chrome`); v4–v6 died on quoting in the remote
+  launch block (a bare paren, then an apostrophe, inside a
+  single-quoted remote `bash -c` script are live metacharacters
+  through the two shell parsings — the rule is now: no apostrophe
+  and no bare paren in any comment inside a remote `bash -c` block,
+  audited clean in both check scripts).

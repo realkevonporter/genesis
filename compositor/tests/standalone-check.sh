@@ -634,6 +634,16 @@ EXIT_CODE="$(ssh_guest "sudo /tmp/standalone-guest.sh stop-compositor" | tr -d '
 echo "standalone-check: milestone 8 (crash) — second launch reached READY after the crash (DRM master released), clean exit 0"
 stop_guest
 
+# --- Stage 4 adoption (adoption-check.sh, standalone backend) ------------
+# Boots its own KVM guest and proves the adoption milestones on real
+# DRM. It fails on a Stage 3 tree by design (no adopt op yet) — see
+# adoption-check.sh. Runs here, after all Stage 3 guest phases and
+# before the documentation/measurements section, so a Stage 3 failure
+# still attributes to its own phase and the adoption result is separate.
+SEVYN_CHECK_DIR="$CHECK_DIR" compositor/tests/adoption-check.sh --standalone \
+    || fail "adoption check (standalone) failed"
+echo "standalone-check: Stage 4 adoption milestones proven (standalone)"
+
 # --- Phase 4: startup + shutdown documented (milestone 9) ----------------------
 echo "standalone-check: phase 4 — documentation matches what was exercised..."
 for needle in "--standalone" "SEVYN READY" "socket_up_ms" "SEVYN SHUTDOWN clean" "101" "NOT PROVEN"; do
