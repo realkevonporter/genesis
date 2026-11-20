@@ -23,9 +23,9 @@ use calloop::EventLoop;
 use smithay::{
     backend::renderer::element::memory::MemoryRenderBuffer,
     delegate_compositor, delegate_content_type, delegate_cursor_shape, delegate_dmabuf,
-    delegate_idle_inhibit, delegate_idle_notify, delegate_layer_shell, delegate_output,
-    delegate_presentation, delegate_seat, delegate_shm, delegate_single_pixel_buffer,
-    delegate_viewporter, delegate_xdg_activation, delegate_xdg_shell,
+    delegate_foreign_toplevel_list, delegate_idle_inhibit, delegate_idle_notify,
+    delegate_layer_shell, delegate_output, delegate_presentation, delegate_seat, delegate_shm,
+    delegate_single_pixel_buffer, delegate_viewporter, delegate_xdg_activation, delegate_xdg_shell,
     desktop::{layer_map_for_output, LayerSurface, PopupManager, Space, Window, WindowSurfaceType},
     input::{
         pointer::{CursorIcon, CursorImageStatus, CursorImageSurfaceData},
@@ -34,6 +34,7 @@ use smithay::{
     },
     reexports::wayland_server::{
         backend::{ClientData, ClientId, DisconnectReason},
+        delegate_dispatch, delegate_global_dispatch,
         protocol::{wl_buffer::WlBuffer, wl_output::WlOutput, wl_surface::WlSurface},
         Client, DisplayHandle, Resource,
     },
@@ -44,6 +45,7 @@ use smithay::{
         content_type::ContentTypeState,
         cursor_shape::CursorShapeManagerState,
         dmabuf::{DmabufGlobal, DmabufHandler, DmabufState},
+        foreign_toplevel_list::ForeignToplevelListState,
         idle_inhibit::{IdleInhibitHandler, IdleInhibitManagerState},
         idle_notify::{IdleNotifierHandler, IdleNotifierState},
         output::{OutputHandler, OutputManagerState},
@@ -64,9 +66,15 @@ use smithay::{
     },
 };
 
+use wayland_protocols_wlr::foreign_toplevel::v1::server::{
+    zwlr_foreign_toplevel_handle_v1::ZwlrForeignToplevelHandleV1,
+    zwlr_foreign_toplevel_manager_v1::ZwlrForeignToplevelManagerV1,
+};
+
 use crate::{
     cursor::build_default_cursor_buffer,
     drm::DrmRenderer,
+    foreign_toplevel::{ForeignToplevelManagerGlobalData, ForeignToplevelManagerState},
     marker, output as output_mod,
     runtime_bridge::{self, SessionId},
     surface_registry::SurfaceRegistry,
@@ -151,6 +159,13 @@ pub struct GenesisState {
     pub idle_inhibit_state: IdleInhibitManagerState,
     #[allow(dead_code)]
     pub cursor_shape_state: CursorShapeManagerState,
+    /// Stage 4: `ext-foreign-toplevel-list-v1` (Smithay ships it) and
+    /// the Genesis-implemented `zwlr_foreign_toplevel_manager_v1`
+    /// global (see `foreign_toplevel.rs`). Each creates one global
+    /// at startup and is retained for the same reason as
+    /// `output_manager_state` above.
+    pub foreign_toplevel_list_state: ForeignToplevelListState,
+    pub foreign_toplevel_manager_state: ForeignToplevelManagerState,
 
     pub seat: Seat<Self>,
     /// The seat's keyboard handle (created once; Stage 2 has one seat).
@@ -326,6 +341,11 @@ impl GenesisState {
         let xdg_activation_state = XdgActivationState::new::<Self>(&dh);
         let idle_inhibit_state = IdleInhibitManagerState::new::<Self>(&dh);
         let cursor_shape_state = CursorShapeManagerState::new::<Self>(&dh);
+        // Stage 4: the list global (Smithay ships it) and the
+        // Genesis-implemented manager global (see
+        // `foreign_toplevel.rs`).
+        let foreign_toplevel_list_state = ForeignToplevelListState::new::<Self>(&dh);
+        let foreign_toplevel_manager_state = ForeignToplevelManagerState::new(&dh);
         // The idle-notifier's timers need a `LoopHandle<'static, Self>`,
         // which neither backend's loop can supply (standalone's loop is
         // `EventLoop<StandaloneLoop>`, nested has no calloop loop), so
@@ -353,6 +373,8 @@ impl GenesisState {
             xdg_activation_state,
             idle_inhibit_state,
             cursor_shape_state,
+            foreign_toplevel_list_state,
+            foreign_toplevel_manager_state,
             seat,
             keyboard,
             pointer,
@@ -562,6 +584,11 @@ impl GenesisState {
             let topmost = self.space.elements().next_back().cloned();
             self.set_keyboard_focus(topmost.as_ref());
         }
+
+        // Stage 4: announce new toplevels to manager/list clients,
+        // echo title/app_id/state changes, and close entries for
+        // toplevels that went away (see `foreign_toplevel.rs`).
+        self.sync_foreign_toplevels();
     }
 
     /// Refresh a record's app id / title from the toplevel state. Emits a
@@ -862,6 +889,11 @@ impl XdgActivationHandler for GenesisState {
         }
     }
 }
+
+delegate_foreign_toplevel_list!(GenesisState);
+delegate_global_dispatch!(GenesisState: [ZwlrForeignToplevelManagerV1: ForeignToplevelManagerGlobalData] => ForeignToplevelManagerState);
+delegate_dispatch!(GenesisState: [ZwlrForeignToplevelManagerV1: ()] => ForeignToplevelManagerState);
+delegate_dispatch!(GenesisState: [ZwlrForeignToplevelHandleV1: u64] => ForeignToplevelManagerState);
 
 delegate_compositor!(GenesisState);
 delegate_shm!(GenesisState);

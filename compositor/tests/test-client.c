@@ -20,6 +20,31 @@
  * Build: gcc with wayland-client; xdg-shell + presentation-time protocol
  * sources are generated at build time by wayland-scanner (see
  * v2/image/build-m1-image.sh and compositor/tests/nested-check.sh).
+ *
+ * Stage 4: `--manager` mode (a separate entry point in this file, kept
+ * in its own functions so the merge with the check track's adoption
+ * modes stays clean) binds `zwlr_foreign_toplevel_manager_v1` (v2)
+ * and `ext-foreign-toplevel-list-v1`, lists the open toplevels, and
+ * exercises one manager request on a target app_id. It needs the wlr
+ * + ext-list protocol sources generated at build time
+ * (`wlr-foreign-toplevel-management-unstable-v1.xml` from the
+ * wayland-protocols-wlr crate, `ext-foreign-toplevel-list-v1.xml`
+ * from wayland-protocols) and `-DHAVE_WLR_FOREIGN_TOPLEVEL`;
+ * without the define the default build is unchanged and `--manager`
+ * prints an error. Env:
+ *   SEVYN_MANAGER_TARGET_APP_ID  app_id to act on (unset = list only)
+ *   SEVYN_MANAGER_ACTION         activate|close|minimize|unminimize|
+ *                                maximize|unmaximize|fullscreen|
+ *                                unfullscreen|none (default none)
+ *   SEVYN_MANAGER_LOG            default /tmp/sevyn-manager-client.log
+ *   SEVYN_MANAGER_LIST_WAIT_MS   ms to collect the listing (default 1500)
+ *   SEVYN_MANAGER_ACTION_WAIT_MS ms to observe after the action
+ *                                (default 1500)
+ * Markers (same log file + console): `MANAGER TOPLEVEL app_id=..
+ * title=.. state=..`, `MANAGER STATE ...`, `MANAGER CLOSED ...`,
+ * `MANAGER ACTIVATE|CLOSE|MINIMIZE|MAXIMIZE|FULLSCREEN app_id=..`,
+ * `LIST TOPLEVEL identifier=.. title=.. app_id=..`, `LIST CLOSED ...`,
+ * `MANAGER DONE`.
  */
 #define _GNU_SOURCE
 #include <errno.h>
@@ -38,6 +63,10 @@
 #include <wayland-client.h>
 #include "xdg-shell-client-protocol.h"
 #include "presentation-time-client-protocol.h"
+#ifdef HAVE_WLR_FOREIGN_TOPLEVEL
+#include "wlr-foreign-toplevel-management-unstable-v1-client-protocol.h"
+#include "ext-foreign-toplevel-list-v1-client-protocol.h"
+#endif
 
 /* Stage 3: the client takes its identity from the environment so one
  * binary can stand in for two different surfaces (Shell + app) in the
@@ -551,8 +580,477 @@ static const struct wl_registry_listener registry_listener = {
     .global_remove = registry_global_remove,
 };
 
-int main(void)
+/* --- --manager mode (Stage 4) ----------------------------------------- */
+/* Kept in its own functions, separate from the M1 client above: this
+ * client binds zwlr_foreign_toplevel_manager_v1 (v2), lists the open
+ * toplevels, and exercises one manager request on a target app_id.
+ * It creates no surfaces of its own. The check track owns the
+ * adoption test modes; this mode is the manager/list proof only.
+ * Guarded by HAVE_WLR_FOREIGN_TOPLEVEL so the default build (which
+ * does not generate the wlr protocol sources) is unaffected. */
+#ifdef HAVE_WLR_FOREIGN_TOPLEVEL
+
+#define MANAGER_MAX_TOPLEVELS 64
+
+struct manager_toplevel {
+    struct zwlr_foreign_toplevel_handle_v1 *handle;
+    char app_id[128];
+    char title[256];
+    char state[64]; /* last decoded state names, comma-separated */
+    bool got_done;  /* initial title/app_id/state burst complete */
+    bool closed;
+};
+
+/* One `ext-foreign-toplevel-list-v1` handle: the same toplevel seen
+ * through the list protocol. Matched to a manager toplevel by
+ * app_id/title, not by the identifier (the identifier is an opaque
+ * compositor-chosen string, unrelated to the manager handle). */
+struct list_toplevel {
+    struct ext_foreign_toplevel_handle_v1 *handle;
+    char identifier[64];
+    char app_id[128];
+    char title[256];
+    bool got_done;
+    bool closed;
+};
+
+struct manager_app {
+    struct wl_display *display;
+    struct wl_registry *registry;
+    struct zwlr_foreign_toplevel_manager_v1 *manager;
+    struct ext_foreign_toplevel_list_v1 *list;
+    struct wl_seat *seat;
+    struct manager_toplevel toplevels[MANAGER_MAX_TOPLEVELS];
+    int ntoplevels;
+    struct list_toplevel list_toplevels[MANAGER_MAX_TOPLEVELS];
+    int nlist_toplevels;
+    bool manager_finished;
+};
+
+static int manager_getenv_int(const char *name, int def)
 {
+    const char *v = getenv(name);
+    if (!v || !*v)
+        return def;
+    int n = atoi(v);
+    return n > 0 ? n : def;
+}
+
+/* Dispatch Wayland events for up to `ms` milliseconds, then return.
+ * poll() guards the blocking read so a quiet compositor cannot stall
+ * the client past the deadline. */
+static void manager_dispatch_for_ms(struct wl_display *display, int ms)
+{
+    long long deadline = now_ms() + ms;
+    int fd = wl_display_get_fd(display);
+    for (;;) {
+        if (wl_display_dispatch_pending(display) < 0)
+            return;
+        long long remaining = deadline - now_ms();
+        if (remaining <= 0)
+            break;
+        struct pollfd pfd = { .fd = fd, .events = POLLIN };
+        int r = poll(&pfd, 1, (int)remaining);
+        if (r < 0) {
+            if (errno == EINTR)
+                continue;
+            return;
+        }
+        if (r > 0 && (pfd.revents & (POLLIN | POLLERR | POLLHUP))) {
+            if (wl_display_dispatch(display) < 0)
+                return;
+        }
+    }
+    wl_display_dispatch_pending(display);
+}
+
+/* --- foreign-toplevel handle events --- */
+
+static void manager_handle_title(void *data, struct zwlr_foreign_toplevel_handle_v1 *handle,
+                                 const char *title)
+{
+    struct manager_toplevel *t = data;
+    (void)handle;
+    snprintf(t->title, sizeof(t->title), "%s", title ? title : "");
+}
+
+static void manager_handle_app_id(void *data, struct zwlr_foreign_toplevel_handle_v1 *handle,
+                                  const char *app_id)
+{
+    struct manager_toplevel *t = data;
+    (void)handle;
+    snprintf(t->app_id, sizeof(t->app_id), "%s", app_id ? app_id : "");
+}
+
+static void manager_handle_output_enter(void *data,
+                                        struct zwlr_foreign_toplevel_handle_v1 *handle,
+                                        struct wl_output *output)
+{
+    (void)data;
+    (void)handle;
+    (void)output;
+    /* The compositor has one output; the enter event carries no
+     * information this mode needs. */
+}
+
+static void manager_handle_output_leave(void *data,
+                                        struct zwlr_foreign_toplevel_handle_v1 *handle,
+                                        struct wl_output *output)
+{
+    (void)data;
+    (void)handle;
+    (void)output;
+}
+
+static void manager_handle_state(void *data, struct zwlr_foreign_toplevel_handle_v1 *handle,
+                                 struct wl_array *state)
+{
+    struct manager_toplevel *t = data;
+    (void)handle;
+    /* The state array is one uint32 per flag (XML enum `state`:
+     * 0 maximized, 1 minimized, 2 activated, 3 fullscreen). */
+    t->state[0] = '\0';
+    uint32_t *values = state->data;
+    size_t n = state->size / sizeof(uint32_t);
+    for (size_t i = 0; i < n; i++) {
+        const char *name;
+        switch (values[i]) {
+        case 0: name = "maximized"; break;
+        case 1: name = "minimized"; break;
+        case 2: name = "activated"; break;
+        case 3: name = "fullscreen"; break;
+        default: name = "unknown"; break;
+        }
+        if (t->state[0])
+            strncat(t->state, ",", sizeof(t->state) - strlen(t->state) - 1);
+        strncat(t->state, name, sizeof(t->state) - strlen(t->state) - 1);
+    }
+    /* Log state changes after the initial burst; the burst itself is
+     * reported once by `done` below. */
+    if (t->got_done)
+        log_line("MANAGER STATE app_id=%s state=%s", t->app_id,
+                 t->state[0] ? t->state : "(none)");
+}
+
+static void manager_handle_done(void *data, struct zwlr_foreign_toplevel_handle_v1 *handle)
+{
+    struct manager_toplevel *t = data;
+    (void)handle;
+    if (!t->got_done) {
+        t->got_done = true;
+        log_line("MANAGER TOPLEVEL app_id=%s title=%s state=%s", t->app_id, t->title,
+                 t->state[0] ? t->state : "(none)");
+    }
+}
+
+static void manager_handle_closed(void *data, struct zwlr_foreign_toplevel_handle_v1 *handle)
+{
+    struct manager_toplevel *t = data;
+    (void)handle;
+    t->closed = true;
+    log_line("MANAGER CLOSED app_id=%s", t->app_id);
+}
+
+static void manager_handle_parent(void *data, struct zwlr_foreign_toplevel_handle_v1 *handle,
+                                  struct zwlr_foreign_toplevel_handle_v1 *parent)
+{
+    (void)data;
+    (void)handle;
+    (void)parent;
+    /* v3 only; the manager is bound at v2, so this never arrives.
+     * The handler must still exist: libwayland aborts on a NULL
+     * entry for an event the compositor sends. */
+}
+
+static const struct zwlr_foreign_toplevel_handle_v1_listener manager_handle_listener = {
+    .title = manager_handle_title,
+    .app_id = manager_handle_app_id,
+    .output_enter = manager_handle_output_enter,
+    .output_leave = manager_handle_output_leave,
+    .state = manager_handle_state,
+    .done = manager_handle_done,
+    .closed = manager_handle_closed,
+    .parent = manager_handle_parent,
+};
+
+/* --- ext-foreign-toplevel-list events --- */
+
+static void list_handle_identifier(void *data, struct ext_foreign_toplevel_handle_v1 *handle,
+                                   const char *identifier)
+{
+    struct list_toplevel *t = data;
+    (void)handle;
+    snprintf(t->identifier, sizeof(t->identifier), "%s", identifier ? identifier : "");
+}
+
+static void list_handle_title(void *data, struct ext_foreign_toplevel_handle_v1 *handle,
+                              const char *title)
+{
+    struct list_toplevel *t = data;
+    (void)handle;
+    snprintf(t->title, sizeof(t->title), "%s", title ? title : "");
+}
+
+static void list_handle_app_id(void *data, struct ext_foreign_toplevel_handle_v1 *handle,
+                               const char *app_id)
+{
+    struct list_toplevel *t = data;
+    (void)handle;
+    snprintf(t->app_id, sizeof(t->app_id), "%s", app_id ? app_id : "");
+}
+
+static void list_handle_done(void *data, struct ext_foreign_toplevel_handle_v1 *handle)
+{
+    struct list_toplevel *t = data;
+    (void)handle;
+    if (!t->got_done) {
+        t->got_done = true;
+        log_line("LIST TOPLEVEL identifier=%s title=%s app_id=%s", t->identifier, t->title,
+                 t->app_id);
+    }
+}
+
+static void list_handle_closed(void *data, struct ext_foreign_toplevel_handle_v1 *handle)
+{
+    struct list_toplevel *t = data;
+    (void)handle;
+    t->closed = true;
+    log_line("LIST CLOSED identifier=%s app_id=%s", t->identifier, t->app_id);
+}
+
+static const struct ext_foreign_toplevel_handle_v1_listener list_handle_listener = {
+    .identifier = list_handle_identifier,
+    .title = list_handle_title,
+    .app_id = list_handle_app_id,
+    .done = list_handle_done,
+    .closed = list_handle_closed,
+};
+
+static void list_toplevel_event(void *data, struct ext_foreign_toplevel_list_v1 *list,
+                                struct ext_foreign_toplevel_handle_v1 *handle)
+{
+    struct manager_app *m = data;
+    (void)list;
+    if (m->nlist_toplevels >= MANAGER_MAX_TOPLEVELS) {
+        log_line("LIST error: too many toplevels (max %d)", MANAGER_MAX_TOPLEVELS);
+        return;
+    }
+    struct list_toplevel *t = &m->list_toplevels[m->nlist_toplevels++];
+    memset(t, 0, sizeof(*t));
+    t->handle = handle;
+    ext_foreign_toplevel_handle_v1_add_listener(handle, &list_handle_listener, t);
+}
+
+static void list_finished_event(void *data, struct ext_foreign_toplevel_list_v1 *list)
+{
+    (void)data;
+    (void)list;
+    log_line("LIST FINISHED");
+}
+
+static const struct ext_foreign_toplevel_list_v1_listener list_listener = {
+    .toplevel = list_toplevel_event,
+    .finished = list_finished_event,
+};
+
+/* --- foreign-toplevel manager events --- */
+
+static void manager_toplevel_event(void *data,
+                                   struct zwlr_foreign_toplevel_manager_v1 *manager,
+                                   struct zwlr_foreign_toplevel_handle_v1 *handle)
+{
+    struct manager_app *m = data;
+    (void)manager;
+    if (m->ntoplevels >= MANAGER_MAX_TOPLEVELS) {
+        log_line("MANAGER error: too many toplevels (max %d)", MANAGER_MAX_TOPLEVELS);
+        return;
+    }
+    struct manager_toplevel *t = &m->toplevels[m->ntoplevels++];
+    memset(t, 0, sizeof(*t));
+    t->handle = handle;
+    zwlr_foreign_toplevel_handle_v1_add_listener(handle, &manager_handle_listener, t);
+}
+
+static void manager_finished_event(void *data, struct zwlr_foreign_toplevel_manager_v1 *manager)
+{
+    struct manager_app *m = data;
+    (void)manager;
+    m->manager_finished = true;
+    log_line("MANAGER FINISHED");
+}
+
+static const struct zwlr_foreign_toplevel_manager_v1_listener manager_listener = {
+    .toplevel = manager_toplevel_event,
+    .finished = manager_finished_event,
+};
+
+/* --- seat (activate needs one) --- */
+
+static void manager_seat_capabilities(void *data, struct wl_seat *seat, uint32_t caps)
+{
+    (void)data;
+    (void)seat;
+    (void)caps;
+}
+
+static void manager_seat_name(void *data, struct wl_seat *seat, const char *name)
+{
+    (void)data;
+    (void)seat;
+    (void)name;
+}
+
+static const struct wl_seat_listener manager_seat_listener = {
+    .capabilities = manager_seat_capabilities,
+    .name = manager_seat_name,
+};
+
+/* --- registry --- */
+
+static void manager_registry_global(void *data, struct wl_registry *registry, uint32_t name,
+                                    const char *interface, uint32_t version)
+{
+    struct manager_app *m = data;
+    if (strcmp(interface, zwlr_foreign_toplevel_manager_v1_interface.name) == 0) {
+        m->manager = wl_registry_bind(registry, name,
+                                      &zwlr_foreign_toplevel_manager_v1_interface, 2);
+        zwlr_foreign_toplevel_manager_v1_add_listener(m->manager, &manager_listener, m);
+    } else if (strcmp(interface, ext_foreign_toplevel_list_v1_interface.name) == 0) {
+        m->list = wl_registry_bind(registry, name,
+                                   &ext_foreign_toplevel_list_v1_interface, 1);
+        ext_foreign_toplevel_list_v1_add_listener(m->list, &list_listener, m);
+    } else if (strcmp(interface, wl_seat_interface.name) == 0) {
+        m->seat = wl_registry_bind(registry, name, &wl_seat_interface, 5);
+        wl_seat_add_listener(m->seat, &manager_seat_listener, m);
+    }
+    (void)version;
+}
+
+static void manager_registry_global_remove(void *data, struct wl_registry *registry,
+                                           uint32_t name)
+{
+    (void)data;
+    (void)registry;
+    (void)name;
+}
+
+static const struct wl_registry_listener manager_registry_listener = {
+    .global = manager_registry_global,
+    .global_remove = manager_registry_global_remove,
+};
+
+static int run_manager_mode(void)
+{
+    start_ms = now_ms();
+    console_fd = open("/dev/console", O_WRONLY | O_NONBLOCK);
+    const char *log_path = getenv("SEVYN_MANAGER_LOG");
+    log_fd = open(log_path && *log_path ? log_path : "/tmp/sevyn-manager-client.log",
+                  O_WRONLY | O_CREAT | O_TRUNC, 0644);
+
+    struct manager_app m;
+    memset(&m, 0, sizeof(m));
+    m.display = wl_display_connect(NULL);
+    if (!m.display) {
+        log_line("MANAGER error: cannot connect to Wayland display (WAYLAND_DISPLAY=%s)",
+                 getenv("WAYLAND_DISPLAY") ? getenv("WAYLAND_DISPLAY") : "(unset)");
+        return 1;
+    }
+    m.registry = wl_display_get_registry(m.display);
+    wl_registry_add_listener(m.registry, &manager_registry_listener, &m);
+    if (wl_display_roundtrip(m.display) < 0) {
+        log_line("MANAGER error: registry roundtrip failed");
+        return 1;
+    }
+    if (!m.manager) {
+        log_line("MANAGER error: no zwlr_foreign_toplevel_manager_v1 global");
+        return 1;
+    }
+    if (!m.list) {
+        log_line("MANAGER error: no ext_foreign_toplevel_list_v1 global");
+        return 1;
+    }
+    /* Flush the bind requests queued by the registry handler:
+     * `wl_display_roundtrip` returns as soon as the sync callback
+     * arrives and does NOT flush requests queued after it (the
+     * manager/list binds) — without this flush the binds sit in the
+     * outgoing buffer and the compositor never sees them, so no
+     * toplevel event ever arrives. */
+    wl_display_flush(m.display);
+
+    /* Collect the listing: the toplevel events arrive once the bind
+     * is processed; the roundtrip above only settled the registry. */
+    manager_dispatch_for_ms(m.display,
+                            manager_getenv_int("SEVYN_MANAGER_LIST_WAIT_MS", 1500));
+
+    const char *target = getenv("SEVYN_MANAGER_TARGET_APP_ID");
+    const char *action = getenv("SEVYN_MANAGER_ACTION");
+    if (target && *target && action && *action && strcmp(action, "none") != 0) {
+        struct manager_toplevel *t = NULL;
+        for (int i = 0; i < m.ntoplevels; i++) {
+            if (strcmp(m.toplevels[i].app_id, target) == 0) {
+                t = &m.toplevels[i];
+                break;
+            }
+        }
+        if (!t) {
+            log_line("MANAGER error: no toplevel with app_id=%s", target);
+            return 1;
+        }
+        if (strcmp(action, "activate") == 0) {
+            if (!m.seat) {
+                log_line("MANAGER error: no seat for activate");
+                return 1;
+            }
+            log_line("MANAGER ACTIVATE app_id=%s", target);
+            zwlr_foreign_toplevel_handle_v1_activate(t->handle, m.seat);
+        } else if (strcmp(action, "close") == 0) {
+            log_line("MANAGER CLOSE app_id=%s", target);
+            zwlr_foreign_toplevel_handle_v1_close(t->handle);
+        } else if (strcmp(action, "minimize") == 0) {
+            log_line("MANAGER MINIMIZE app_id=%s", target);
+            zwlr_foreign_toplevel_handle_v1_set_minimized(t->handle);
+        } else if (strcmp(action, "unminimize") == 0) {
+            log_line("MANAGER UNMINIMIZE app_id=%s", target);
+            zwlr_foreign_toplevel_handle_v1_unset_minimized(t->handle);
+        } else if (strcmp(action, "maximize") == 0) {
+            log_line("MANAGER MAXIMIZE app_id=%s", target);
+            zwlr_foreign_toplevel_handle_v1_set_maximized(t->handle);
+        } else if (strcmp(action, "unmaximize") == 0) {
+            log_line("MANAGER UNMAXIMIZE app_id=%s", target);
+            zwlr_foreign_toplevel_handle_v1_unset_maximized(t->handle);
+        } else if (strcmp(action, "fullscreen") == 0) {
+            log_line("MANAGER FULLSCREEN app_id=%s", target);
+            zwlr_foreign_toplevel_handle_v1_set_fullscreen(t->handle, NULL);
+        } else if (strcmp(action, "unfullscreen") == 0) {
+            log_line("MANAGER UNFULLSCREEN app_id=%s", target);
+            zwlr_foreign_toplevel_handle_v1_unset_fullscreen(t->handle);
+        } else {
+            log_line("MANAGER error: unknown action %s", action);
+            return 1;
+        }
+        wl_display_flush(m.display);
+        manager_dispatch_for_ms(m.display,
+                                manager_getenv_int("SEVYN_MANAGER_ACTION_WAIT_MS", 1500));
+    }
+
+    log_line("MANAGER DONE toplevels=%d", m.ntoplevels);
+    return 0;
+}
+
+#endif /* HAVE_WLR_FOREIGN_TOPLEVEL */
+
+int main(int argc, char **argv)
+{
+    if (argc > 1 && strcmp(argv[1], "--manager") == 0) {
+#ifdef HAVE_WLR_FOREIGN_TOPLEVEL
+        return run_manager_mode();
+#else
+        fprintf(stderr,
+                "test-client: --manager needs HAVE_WLR_FOREIGN_TOPLEVEL "
+                "(build with the wlr protocol sources)\n");
+        return 1;
+#endif
+    }
     start_ms = now_ms();
     console_fd = open("/dev/console", O_WRONLY | O_NONBLOCK);
     log_fd = open(client_log_path(), O_WRONLY | O_CREAT | O_TRUNC, 0644);

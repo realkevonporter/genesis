@@ -144,10 +144,10 @@ script runs in CI.
   exist as clients yet; the test client stands in for an application,
   and the bridge markers are the association record the Runtime will
   consume. Process launch by the compositor is a Stage 3/Runtime item.
-- **No adoption.** `foreign_toplevel_list` is not advertised and no
-  manager global is implemented — that is Stage 4 (see the plan's
-  honest gap: Smithay 0.7.0 ships the list protocol but not
-  `zwlr_foreign_toplevel_manager_v1`).
+- **No adoption.** The manager + list protocols are implemented
+  (Stage 4, see below), but the adoption itself — placing an adopted
+  surface inside a Browser window's content rect — is the adoption
+  track's work and is not here yet.
 - **No dmabuf proof, no frame-rate claim.** SHM is the buffer path in
   the nested check; the dmabuf global exists in standalone mode and
   imports into the active renderer, but the zero-copy path and 60 fps
@@ -241,6 +241,8 @@ not shipped):
 | Global                                 | Smithay source                                                           | What Genesis does with it                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
 | -------------------------------------- | ------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `zwlr_layer_shell_v1` v4               | `wayland::shell::wlr_layer::WlrLayerShellState` (`WlrLayerShellHandler`) | Layer surfaces are mapped into the output's `LayerMap`; the scene's `render_elements_for_output` already renders mapped layers (background/bottom below windows, top/overlay above). A new layer surface gets an initial configure; commits re-arrange the map. **The Shell migrating its chrome onto layer surfaces is a follow-up** — the Shell works today with chrome drawn inside its own surface. Known limitation: pointer/keyboard input is not yet routed to layer surfaces (`input.rs` hit-tests the `Space` only), so a click on a layer surface falls through to the toplevel beneath it; that routing lands with the Shell migration. |
+| `zwlr_foreign_toplevel_manager_v1` v2 | Genesis-implemented (`src/foreign_toplevel.rs`, from `wayland-protocols-wlr` 0.3.12 `foreign_toplevel::v1` server types) | The manager global Smithay 0.7.0 does not ship (see Stage 4 below). On bind, a `toplevel` event per open toplevel (then title / app_id / output_enter / state / done); the same events as toplevels open, close, or change. Requests act on the named toplevel: `activate` (raise + focus), `close` (existing close path), `set_minimized` / `set_maximized` / `set_fullscreen` (+ unsets), `set_rectangle` (minimize hint only). Direct activation of an adopted surface is IGNORED. |
+| `ext-foreign-toplevel-list-v1` v1 | `wayland::foreign_toplevel_list::ForeignToplevelListState` (Smithay ships it) | Wired alongside the manager (Stage 4 below): one list handle per toplevel, title / app_id updated as they change, `closed` when the toplevel goes away. List-only — no requests. |
 | `wp_presentation` v2                   | `wayland::presentation::PresentationState`                               | Feedback is requested per surface and marked `presented` after a frame is actually queued/submitted, with the `CLOCK_MONOTONIC` timestamp, the output's fixed refresh, and the frame sequence number (`render::send_presentation_feedback`). A skipped (empty-damage) frame sends no feedback — content is "presented" only when it reaches the screen.                                                                                                                                                                                                                                                                                            |
 | `wp_viewporter` v1                     | `wayland::viewporter::ViewporterState`                                   | Advertised; no Genesis-side policy (viewporting is applied by the renderer when it imports the surface).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 | `wp_content_type_manager_v1` v1        | `wayland::content_type::ContentTypeState`                                | Advertised; the content-type hint is recorded by Smithay and available to the renderer. No Genesis-side policy yet.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
@@ -251,11 +253,11 @@ not shipped):
 | `wp_cursor_shape_manager_v1` v2        | `wayland::cursor_shape::CursorShapeManagerState`                         | A client-requested shape clears the client-set cursor surface and is recorded; the built-in default arrow is drawn for it (see "Cursor" below). The tablet half of the protocol needs `TabletSeatHandler`, which is implemented as an empty no-op — Genesis advertises **no** tablet global and has no tablet hardware story.                                                                                                                                                                                                                                                                                                                      |
 
 **Not added (Stage 4 / follow-ups, per the plan — left out
-deliberately, not forgotten):** foreign-toplevel manager/list
-(Stage 4), pointer-constraints + relative-pointer (Stage 4),
-data-device clipboard (Stage 4), screencopy, input-method +
-text-input, virtual keyboard, tablet, session lock, fractional
-scaling, XWayland. See `COMPOSITOR_PLAN.md`, "Fully equipped".
+deliberately, not forgotten):** pointer-constraints +
+relative-pointer (Stage 4), data-device clipboard (Stage 4),
+screencopy, input-method + text-input, virtual keyboard, tablet,
+session lock, fractional scaling, XWayland. See
+`COMPOSITOR_PLAN.md`, "Fully equipped".
 
 ### Cursor
 
@@ -443,6 +445,142 @@ it. See `compositor/RECOVERY.md`.
   migration (see "Protocols" above); **cursor-shape** renders every
   named shape as the one built-in arrow; **the DPMS timeout** has no
   Settings UI yet (fixed 5 minutes).
+
+## Stage 4 — foreign-toplevel manager + list (manager track)
+
+Stage 4's listing/control side: `ext-foreign-toplevel-list-v1`
+(Smithay ships it) wired alongside a Genesis-implemented
+`zwlr_foreign_toplevel_manager_v1` global (v2). Smithay 0.7.0 has no
+manager module — the gap the plan names honestly — so the global is
+implemented in `src/foreign_toplevel.rs` on top of `wayland-server`,
+from the maintained generated types in `wayland-protocols-wlr`
+0.3.12 (`foreign_toplevel::v1`, server module; added as a direct
+dependency in `Cargo.toml`). The adoption itself — placing a surface
+inside a Browser window — is the adoption track's work and lives in
+its own section, not here.
+
+### What the global offers
+
+- **Listing.** A client that binds the manager gets a `toplevel`
+  event for every open toplevel, each followed by `title`, `app_id`,
+  `output_enter` (the one output), `state`, and `done` — and the
+  same events as toplevels open, close, or change title / app_id /
+  state. The list protocol offers the same toplevels list-only (one
+  handle per toplevel; title / app_id updates; `closed` on close).
+  The sync runs at the end of every `reconcile_surfaces`, so an
+  announcement lags a toplevel's creation by at most one main-loop
+  iteration.
+- **Control.** Handle requests act on the named toplevel:
+  `activate` raises the window and gives it keyboard focus;
+  `close` forwards to the existing close path (`send_close`);
+  `set_maximized` / `unset_maximized` and `set_fullscreen` /
+  `unset_fullscreen` set the corresponding xdg-toplevel state and
+  send a configure (with the output size while set, and the window
+  moved to (0, 0); the previous location is restored when both are
+  unset); `set_minimized` / `unset_minimized` unmaps the window
+  from the scene while minimized (and re-maps it on unminimize)
+  with a configure sent; `set_rectangle` stores a minimize hint.
+  `stop` ends the manager's stream (`finished` is sent back).
+  Every request is logged with a `MANAGER ...` marker (see below).
+  Minimized is contradictory with visible: activating, maximizing,
+  or fullscreening a minimized window restores it first, and
+  unmaximizing / unfullscreening a minimized window leaves it
+  unmapped.
+- **Adopted surfaces.** The manager reports every toplevel,
+  adopted or not, with its app_id / title / state. Direct
+  activation of an adopted surface via the manager is IGNORED
+  (`MANAGER ACTIVATE IGNORED ... adopted`) — adopted surfaces are
+  activated only through their Browser window's focus.
+
+### What it deliberately does NOT do
+
+- **No adoption flag in the protocol** — there is none. The Shell
+  hides adopted surfaces from the window list because the Runtime
+  tells it the toplevel is adopted, not because the manager says
+  so.
+- **No placement.** No manager request can move, resize, reparent,
+  or embed a surface — the protocol has no such request, and
+  `set_rectangle` is a minimize hint only, never placement.
+  Adoption is compositor-internal scene placement, owned by the
+  adoption track.
+- **No minimized xdg state.** xdg-shell defines no minimized state,
+  so minimization is manager-side bookkeeping, reported in the
+  manager `state` array; the configure sent on minimize carries no
+  state change.
+- **No `invalid_rectangle` protocol error.** A `set_rectangle`
+  with a negative width or height is ignored and logged
+  (`MANAGER SET_RECTANGLE INVALID ...`); the protocol error is not
+  posted.
+- **Version 2, not 3.** The upstream XML declares version 3, but
+  v3 only adds the `parent` event, which Genesis never sends, so
+  the global advertises v2 per the plan.
+
+### Adoption seam (for the adoption track)
+
+`GenesisState::is_adopted(surface_id)` is the query the manager
+uses for the ignored-activation rule, backed by a set this module
+owns and filled by `GenesisState::note_adopted` /
+`note_released`. The adoption track calls those when it adopts /
+releases, or replaces the backing with its own registry at
+integration — the signature is the contract.
+`GenesisState::adopted_browser_window` is a STUB returning `None`
+until the adoption track provides the mapping; the manager never
+calls it. If the adoption track's interface differs at
+integration, the coordinator resolves it.
+
+### Markers
+
+`MANAGER BOUND toplevels=N`, `MANAGER TOPLEVEL id=N app_id=..
+title=..`, `MANAGER TOPLEVEL UPDATE ...`, `MANAGER TOPLEVEL
+CLOSED id=N`, `MANAGER STATE id=N state=..`,
+`MANAGER ACTIVATE id=N` / `MANAGER ACTIVATE IGNORED id=N adopted`
+/ `MANAGER ACTIVATE UNKNOWN id=N`, `MANAGER CLOSE id=N ok=..`,
+`MANAGER MINIMIZE|MAXIMIZE|FULLSCREEN id=N ...=..`,
+`MANAGER SET_RECTANGLE id=N x=.. y=.. width=.. height=..`,
+`MANAGER STOPPED`, `MANAGER UNBOUND`.
+
+### Exercising it
+
+```sh
+# Build the test client with the wlr + ext-list protocol sources (the
+# default build does not generate them; without
+# -DHAVE_WLR_FOREIGN_TOPLEVEL --manager prints an error and exits 1):
+WLR_XML=~/.cargo/registry/src/*/wayland-protocols-wlr-0.3.12/wlr-protocols/unstable/wlr-foreign-toplevel-management-unstable-v1.xml
+LIST_XML=~/.cargo/registry/src/*/wayland-protocols-0.32.13/protocols/staging/ext-foreign-toplevel-list/ext-foreign-toplevel-list-v1.xml
+wayland-scanner client-header "$WLR_XML" wlr-foreign-toplevel-management-unstable-v1-client-protocol.h
+wayland-scanner private-code "$WLR_XML" wlr-foreign-toplevel-management-unstable-v1-protocol.c
+wayland-scanner client-header "$LIST_XML" ext-foreign-toplevel-list-v1-client-protocol.h
+wayland-scanner private-code "$LIST_XML" ext-foreign-toplevel-list-v1-protocol.c
+gcc -DHAVE_WLR_FOREIGN_TOPLEVEL -o sevyn-test-client-manager tests/test-client.c \
+    xdg-shell-protocol.c presentation-time-protocol.c \
+    wlr-foreign-toplevel-management-unstable-v1-protocol.c \
+    ext-foreign-toplevel-list-v1-protocol.c \
+    -I. $(pkg-config --cflags --libs wayland-client)
+
+# List the open toplevels (manager + list protocols):
+WAYLAND_DISPLAY=<socket> ./sevyn-test-client-manager --manager
+# Act on one (env: SEVYN_MANAGER_TARGET_APP_ID, SEVYN_MANAGER_ACTION
+# = activate|close|minimize|unminimize|maximize|unmaximize|
+#   fullscreen|unfullscreen):
+SEVYN_MANAGER_TARGET_APP_ID=sevyn.app SEVYN_MANAGER_ACTION=minimize \
+    WAYLAND_DISPLAY=<socket> ./sevyn-test-client-manager --manager
+# Markers land in /tmp/sevyn-manager-client.log
+# (SEVYN_MANAGER_LOG overrides) and on the console.
+```
+
+### Not yet (manager track, named not claimed)
+
+- **Integrated adopted-activation proof.** The ignored-activation
+  rule is proven at the manager level with a stubbed adoption
+  state (unit test `adopted_set_tracks_note_and_release`); the
+  end-to-end proof — a real adopted surface's direct activation
+  ignored while its Browser window still activates it — waits on
+  the adoption track and is proven at integration.
+- **The list protocol's proof rides with the manager client.**
+  `--manager` binds `ext-foreign-toplevel-list-v1` too and logs
+  `LIST TOPLEVEL ...` / `LIST CLOSED ...` for the same toplevels,
+  so the list global is proven live by a real client, not only by
+  the compositor's sync. There is no standalone list-only client.
 
 ## Build
 

@@ -47,6 +47,7 @@
 mod backend;
 mod cursor;
 mod drm;
+mod foreign_toplevel;
 mod idle;
 mod input;
 mod logging;
