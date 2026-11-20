@@ -43,7 +43,10 @@ jobs:
             libinput-dev \
             libgbm-dev \
             libseat-dev \
-            wayland-protocols
+            wayland-protocols \
+            weston \
+            xvfb \
+            xdotool
       - name: Build the Rust compositor
         working-directory: compositor
         run: cargo build --locked
@@ -58,6 +61,17 @@ jobs:
           wayland-scanner client-header /usr/share/wayland-protocols/stable/xdg-shell/xdg-shell.xml /tmp/xdg-shell-client-protocol.h
           wayland-scanner private-code /usr/share/wayland-protocols/stable/xdg-shell/xdg-shell.xml /tmp/xdg-shell-protocol.c
           gcc -o /tmp/sevyn-test-client compositor/tests/test-client.c /tmp/xdg-shell-protocol.c -I/tmp $(pkg-config --cflags --libs wayland-client)
+      # The Stage 2 nested check: boots the compositor under headless
+      # Weston, connects the real test client, and asserts the nested
+      # milestone markers (output created, surface accepted + associated,
+      # input routed, bridge close, clean shutdown, no orphans). It
+      # proves function, not fps — the GF65 is the fps proof.
+      # (libegl-mesa0 is Weston's GL dependency; without it the winit
+      # backend cannot create its EGL context under Weston.)
+      - name: Run the nested compositor check
+        run: |
+          sudo apt-get install -y -qq libegl-mesa0
+          compositor/tests/nested-check.sh
 
   format:
     runs-on: ubuntu-24.04
