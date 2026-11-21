@@ -28,7 +28,9 @@
 //! socket at `$XDG_RUNTIME_DIR/sevyn-compositor.sock`, mode 0600,
 //! newline-delimited JSON, protocol version 1. Stage 2 ops: `ping` and
 //! `close`. The peer must have the same uid as the compositor
-//! (`SO_PEERCRED`); pid-binding to a known Runtime pid is Stage 4.
+//! (`SO_PEERCRED`); with `--runtime-pid` (Stage 4) only that pid is
+//! admitted. Stage 4 adds the adoption ops `adopt` / `move` / `resize`
+//! / `release` on the same socket.
 //!
 //! ## Shutdown
 //!
@@ -64,7 +66,10 @@ use smithay::{
 
 use crate::{
     diag, input, marker,
-    render::{popup_elements, send_frames, send_presentation_feedback},
+    render::{
+        adopted_elements, popup_elements, send_frames, send_presentation_feedback, splice_adopted,
+        NestedRenderElements,
+    },
     runtime_bridge::BridgeServer,
     server::{ClientEvent, ClientState, GenesisState},
 };
@@ -79,6 +84,12 @@ extern "C" fn on_signal(_signal: libc::c_int) {
 
 /// Present one frame: render the scene into the winit window, send frame
 /// callbacks, and submit.
+///
+/// Stage 4: the scene is the space's elements with each adoption's
+/// clipped Chromium elements spliced in immediately above its Browser
+/// window's elements (see `render::splice_adopted`), drawn in one pass
+/// — so a Browser move and its adopted element's move are the same
+/// frame, structurally.
 fn render(
     state: &mut GenesisState,
     backend: &mut WinitGraphicsBackend<GlesRenderer>,
@@ -94,11 +105,41 @@ fn render(
             state
                 .space
                 .render_elements_for_output(renderer, &state.output, 1.0)?;
+        let mut elements: Vec<NestedRenderElements<GlesRenderer>> = space_elements
+            .into_iter()
+            .map(|element| match element {
+                smithay::desktop::space::SpaceRenderElements::Surface(element) => {
+                    NestedRenderElements::Surface(element)
+                }
+                smithay::desktop::space::SpaceRenderElements::Element(element) => {
+                    NestedRenderElements::Wrapped(element)
+                }
+                smithay::desktop::space::SpaceRenderElements::_GenericCatcher(_) => {
+                    unreachable!()
+                }
+            })
+            .collect();
+        let adopted: Vec<(
+            smithay::desktop::Window,
+            Vec<NestedRenderElements<GlesRenderer>>,
+        )> = adopted_elements(state, renderer, 1.0)
+            .into_iter()
+            .map(|(window, cropped)| {
+                (
+                    window,
+                    cropped
+                        .into_iter()
+                        .map(NestedRenderElements::Cropped)
+                        .collect(),
+                )
+            })
+            .collect();
+        elements = splice_adopted(elements, adopted);
         let popup_elements = popup_elements(state, renderer, 1.0);
 
         let mut frame = renderer.render(&mut framebuffer, size, Transform::Flipped180)?;
         frame.clear(Color32F::new(0.05, 0.05, 0.08, 1.0), &[damage])?;
-        draw_render_elements(&mut frame, 1.0, &space_elements, &[damage])?;
+        draw_render_elements(&mut frame, 1.0, &elements, &[damage])?;
         draw_render_elements(&mut frame, 1.0, &popup_elements, &[damage])?;
         let _ = frame.finish()?;
     }
@@ -127,6 +168,7 @@ fn render(
 pub fn run(
     socket_name: &str,
     output_size: Size<i32, Logical>,
+    runtime_pid: Option<u32>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     unsafe {
         libc::signal(libc::SIGTERM, on_signal as *const () as libc::sighandler_t);
@@ -152,16 +194,19 @@ pub fn run(
             .with_visible(true),
     )?;
 
-    let mut bridge = BridgeServer::bind(&runtime_dir)?;
+    let mut bridge = BridgeServer::bind(&runtime_dir, runtime_pid)?;
 
     // Children (the Shell, test clients) connect through this socket.
     std::env::set_var("WAYLAND_DISPLAY", socket_name);
 
     marker!(
-        "READY socket={socket_name} bridge={} output={}x{} backend=winit",
+        "READY socket={socket_name} bridge={} output={}x{} backend=winit runtime_pid={}",
         bridge.path.display(),
         output_size.w,
-        output_size.h
+        output_size.h,
+        runtime_pid
+            .map(|pid| pid.to_string())
+            .unwrap_or_else(|| "(any same-uid)".to_string())
     );
 
     let mut close_requested = false;

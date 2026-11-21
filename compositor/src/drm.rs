@@ -33,8 +33,12 @@
 //!   no client sets one, the built-in 16x16 default arrow (`cursor.rs`)
 //!   is drawn instead, so the pointer is never invisible — same
 //!   plane-or-GL rule, via `render::DrmRenderElements`.
-//! * No Stage 4 work: no foreign-toplevel manager, no adoption IPC
-//!   beyond the existing bridge ops.
+//! * No Stage 4 manager global yet (the manager track's work):
+//!   foreign-toplevel list/manager, pointer-constraints, and clipboard
+//!   are not in this backend. The adoption mechanism itself (bridge
+//!   ops, placement, clipping, focus policy — Stage 4, track 1) is
+//!   shared with the nested backend through `adoption.rs` +
+//!   `render.rs` and is live here too.
 //!
 //! ## Failure modes
 //!
@@ -69,6 +73,8 @@
 //! `SEVYN CRASH ...` to stdout and `/tmp/genesis.log` (plan item 10).
 
 use std::{
+    collections::HashMap,
+    os::unix::io::{AsRawFd, OwnedFd, RawFd},
     path::{Path, PathBuf},
     sync::Arc,
     time::Instant,
@@ -77,7 +83,8 @@ use std::{
 use calloop::{
     generic::Generic,
     signals::{Signal, Signals},
-    EventLoop, Interest, LoopSignal, Mode as CalloopMode, PostAction,
+    EventLoop, Interest, LoopHandle, LoopSignal, Mode as CalloopMode, PostAction,
+    RegistrationToken,
 };
 use smithay::{
     backend::{
@@ -117,8 +124,8 @@ use smithay::{
 use crate::{
     diag, input as input_mod, marker,
     render::{
-        cursor_element, default_cursor_element, popup_elements, send_frames,
-        send_presentation_feedback, DrmRenderElements,
+        adopted_elements, cursor_element, default_cursor_element, popup_elements, send_frames,
+        send_presentation_feedback, splice_adopted, DrmRenderElements,
     },
     runtime_bridge::BridgeServer,
     server::{ClientEvent, ClientState, GenesisState},
@@ -130,6 +137,9 @@ pub struct StandaloneConfig {
     pub scale: i32,
     pub rotate: Transform,
     pub no_gles: bool,
+    /// The Runtime pid passed with `--runtime-pid`, if any (Stage 4:
+    /// the bridge socket then admits only that pid).
+    pub runtime_pid: Option<u32>,
 }
 
 /// Parse `--scale N`: an integer scale, 1 or more.
@@ -319,6 +329,12 @@ struct StandaloneLoop {
     started_at: Instant,
     /// When the Wayland socket was up (for `socket_up_ms`).
     socket_up_at: Option<Instant>,
+    /// One calloop source per live bridge connection (see
+    /// `sync_bridge_sources`): the loop must wake when a request
+    /// arrives on an existing connection, not only on new ones.
+    /// Keyed by the watch dup's own fd number, which is unique
+    /// while the dup lives.
+    bridge_sources: HashMap<RawFd, RegistrationToken>,
 }
 
 /// Open a DRM device node through the session and wrap it in a
@@ -528,6 +544,23 @@ where
             SpaceRenderElements::_GenericCatcher(_) => unreachable!(),
         })
         .collect();
+    // Stage 4: each adoption's clipped Chromium elements, spliced in
+    // immediately above its Browser window's elements — the same
+    // placement and clipping as the nested backend (see `render.rs`).
+    let adopted: Vec<(smithay::desktop::Window, Vec<DrmRenderElements<R>>)> =
+        adopted_elements(state, renderer, scale)
+            .into_iter()
+            .map(|(window, cropped)| {
+                (
+                    window,
+                    cropped
+                        .into_iter()
+                        .map(DrmRenderElements::Cropped)
+                        .collect(),
+                )
+            })
+            .collect();
+    elements = splice_adopted(elements, adopted);
     elements.extend(
         popup_elements(state, renderer, scale)
             .into_iter()
@@ -590,6 +623,56 @@ fn accept_client(data: &mut StandaloneLoop, stream: std::os::unix::net::UnixStre
 /// Run the standalone compositor until shutdown. Returns `Ok(())` on a
 /// clean exit (signal); errors are fatal startup/runtime failures and
 /// are reported by `main`.
+/// Keep one calloop source per live bridge connection: readability
+/// on a connection fd wakes the loop so a request is served in the
+/// round it arrives. The listener fd alone (registered at setup)
+/// only fires on *new* connections — data on an existing connection
+/// never wakes the loop, and a request sits until some other source
+/// fires. That is exactly what the first standalone adoption run
+/// showed: every bridge request timed out at the Runtime while the
+/// compositor only processed it once a QMP pointer move woke the
+/// loop. Called at the end of every dispatch round (the listener
+/// firing guarantees a round runs on every new connection, so a
+/// fresh connection is watched from the next round on). Sources for
+/// dead connections are removed in the same pass; the map is keyed
+/// by the watch dup's own fd number, which is unique while the dup
+/// lives, so a recycled stream number cannot alias a stale source.
+fn sync_bridge_sources(handle: &LoopHandle<'_, StandaloneLoop>, data: &mut StandaloneLoop) {
+    let live: HashMap<RawFd, OwnedFd> = data
+        .bridge
+        .connection_watch_fds()
+        .into_iter()
+        .map(|fd| (fd.as_raw_fd(), fd))
+        .collect();
+    data.bridge_sources.retain(|fd, token| {
+        if live.contains_key(fd) {
+            true
+        } else {
+            handle.remove(*token);
+            false
+        }
+    });
+    for (fd, owned) in live {
+        if data.bridge_sources.contains_key(&fd) {
+            continue;
+        }
+        match handle.insert_source(
+            Generic::new(owned, Interest::READ, CalloopMode::Level),
+            |_, _, data: &mut StandaloneLoop| {
+                data.bridge.poll(&mut data.state);
+                Ok(PostAction::Continue)
+            },
+        ) {
+            Ok(token) => {
+                data.bridge_sources.insert(fd, token);
+            }
+            Err(err) => {
+                diag!("bridge: cannot watch a connection fd: {err:?}");
+            }
+        }
+    }
+}
+
 pub fn run_standalone(config: StandaloneConfig) -> Result<(), Box<dyn std::error::Error>> {
     let started_at = Instant::now();
     // The panic hook is installed once in `main` (`logging.rs`); it
@@ -751,7 +834,7 @@ pub fn run_standalone(config: StandaloneConfig) -> Result<(), Box<dyn std::error
     );
 
     // 8. The bridge socket (same channel as nested mode).
-    let bridge = BridgeServer::bind(&runtime_dir)?;
+    let bridge = BridgeServer::bind(&runtime_dir, config.runtime_pid)?;
 
     // 9. The event loop and its sources.
     let mut event_loop: EventLoop<StandaloneLoop> = EventLoop::try_new()?;
@@ -910,18 +993,23 @@ pub fn run_standalone(config: StandaloneConfig) -> Result<(), Box<dyn std::error
         output_lost: false,
         started_at,
         socket_up_at: None,
+        bridge_sources: HashMap::new(),
     };
 
     // The READY marker: the socket is up and the output is claimed.
     let socket_up_ms = started_at.elapsed().as_millis();
     loop_data.socket_up_at = Some(Instant::now());
     marker!(
-        "READY socket={socket_name} bridge={} output={}x{}@{} backend=drm scale={} renderer={renderer_kind} socket_up_ms={socket_up_ms}",
+        "READY socket={socket_name} bridge={} output={}x{}@{} backend=drm scale={} renderer={renderer_kind} socket_up_ms={socket_up_ms} runtime_pid={}",
         loop_data.bridge.path.display(),
         logical_size.w,
         logical_size.h,
         mode_refresh,
-        config.scale
+        config.scale,
+        config
+            .runtime_pid
+            .map(|pid| pid.to_string())
+            .unwrap_or_else(|| "(any same-uid)".to_string())
     );
 
     // The first frame goes out immediately (the empty desktop), so the
@@ -974,14 +1062,17 @@ pub fn run_standalone(config: StandaloneConfig) -> Result<(), Box<dyn std::error
                 diag!("render failed: {err}");
             }
         }
-        // Bridge, every round — not just when its fd is readable. A
-        // reply is queued in `BridgeServer::poll` and only flushed on
-        // the NEXT poll, so polling only on fd readability leaves a
-        // reply stuck in the outbox until some client sends another
-        // request: the Shell-side `close` worked (the session stopped)
-        // but its {"ok":true} never arrived. The nested backend polls
-        // the bridge every round for the same reason (see `backend.rs`).
+        // Bridge, every round — not just when its fd is readable.
+        // The per-connection sources (see `sync_bridge_sources`,
+        // below) make readability wake the loop, and `poll` flushes
+        // a reply in the same call that handled its request, so a
+        // reply no longer waits for the next round. This per-round
+        // poll stays as the drain/flush safety net (queued
+        // `chromium_died` events, degraded detection, a reply left
+        // over from a partial write). The nested backend polls the
+        // bridge every round for the same reason (see `backend.rs`).
         data.bridge.poll(&mut data.state);
+        sync_bridge_sources(&loop_handle, data);
         // Flush after every dispatch round. The display-fd source only
         // flushes when a client SENDS something; without this, events
         // queued outside a client dispatch — pointer/keyboard events

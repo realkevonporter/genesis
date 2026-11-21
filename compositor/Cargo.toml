@@ -69,3 +69,11 @@ calloop = { version = "0.14", features = ["signals"] }
 # Already in the lockfile as transitive dependencies; listed directly.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# `zwlr_foreign_toplevel_manager_v1` (Stage 4): Smithay 0.7.0 ships the
+# list side (`ext-foreign-toplevel-list-v1`) but NOT the manager global,
+# so Genesis implements it from the maintained generated types in
+# `wayland-protocols-wlr` (see COMPOSITOR_PLAN.md, "Language: Rust" —
+# `foreign_toplevel::v1`, client + server modules). Already in the
+# lockfile as a transitive dependency (0.3.12); listed directly with
+# the `server` feature only — Genesis is the server side here.
+wayland-protocols-wlr = { version = "0.3", features = ["server"] }
