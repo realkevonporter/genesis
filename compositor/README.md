@@ -144,10 +144,10 @@ script runs in CI.
   exist as clients yet; the test client stands in for an application,
   and the bridge markers are the association record the Runtime will
   consume. Process launch by the compositor is a Stage 3/Runtime item.
-- **No adoption.** `foreign_toplevel_list` is not advertised and no
-  manager global is implemented — that is Stage 4 (see the plan's
-  honest gap: Smithay 0.7.0 ships the list protocol but not
-  `zwlr_foreign_toplevel_manager_v1`).
+- **Adoption + foreign-toplevel manager/list are both implemented**
+  (Stage 4, see below). The remaining gaps are pointer-constraints,
+  clipboard, and latency measurement (input track, not landed) and
+  real Shell/Chromium embedding (Stage 5 work).
 - **No dmabuf proof, no frame-rate claim.** SHM is the buffer path in
   the nested check; the dmabuf global exists in standalone mode and
   imports into the active renderer, but the zero-copy path and 60 fps
@@ -238,24 +238,26 @@ and exercising the round-trips — see `compositor/ACCEPTANCE.md` for
 what was run and saw; the smoke client itself is scratch in `/tmp`,
 not shipped):
 
-| Global                                 | Smithay source                                                           | What Genesis does with it                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
-| -------------------------------------- | ------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `zwlr_layer_shell_v1` v4               | `wayland::shell::wlr_layer::WlrLayerShellState` (`WlrLayerShellHandler`) | Layer surfaces are mapped into the output's `LayerMap`; the scene's `render_elements_for_output` already renders mapped layers (background/bottom below windows, top/overlay above). A new layer surface gets an initial configure; commits re-arrange the map. **The Shell migrating its chrome onto layer surfaces is a follow-up** — the Shell works today with chrome drawn inside its own surface. Known limitation: pointer/keyboard input is not yet routed to layer surfaces (`input.rs` hit-tests the `Space` only), so a click on a layer surface falls through to the toplevel beneath it; that routing lands with the Shell migration. |
-| `wp_presentation` v2                   | `wayland::presentation::PresentationState`                               | Feedback is requested per surface and marked `presented` after a frame is actually queued/submitted, with the `CLOCK_MONOTONIC` timestamp, the output's fixed refresh, and the frame sequence number (`render::send_presentation_feedback`). A skipped (empty-damage) frame sends no feedback — content is "presented" only when it reaches the screen.                                                                                                                                                                                                                                                                                            |
-| `wp_viewporter` v1                     | `wayland::viewporter::ViewporterState`                                   | Advertised; no Genesis-side policy (viewporting is applied by the renderer when it imports the surface).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
-| `wp_content_type_manager_v1` v1        | `wayland::content_type::ContentTypeState`                                | Advertised; the content-type hint is recorded by Smithay and available to the renderer. No Genesis-side policy yet.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
-| `wp_single_pixel_buffer_manager_v1` v1 | `wayland::single_pixel_buffer::SinglePixelBufferState`                   | Advertised; 1x1 solid-color buffers work as ordinary surface buffers.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
-| `xdg_activation_v1` v1                 | `wayland::xdg_activation::XdgActivationState` (`XdgActivationHandler`)   | `request_activation` raises the surface's window and gives it keyboard focus, exactly like a pointer press (click-to-focus). Tokens are accepted as-is — there is no Shell focus policy yet to refuse one.                                                                                                                                                                                                                                                                                                                                                                                                                                         |
-| `zwp_idle_inhibit_manager_v1` v1       | `wayland::idle_inhibit::IdleInhibitManagerState` (`IdleInhibitHandler`)  | Inhibitors hold the display on (see "Idle / DPMS" below); `IDLE INHIBIT` / `IDLE UNINHIBIT` markers carry the held count.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
-| `ext_idle_notifier_v1` v2              | `wayland::idle_notify::IdleNotifierState` (`IdleNotifierHandler`)        | Clients get `idled` / `resumed` on their own timeouts; every input event feeds `notify_activity`. The notifier's timers run on a dedicated calloop loop owned by the state (see `idle.rs` — neither backend's loop can supply a `LoopHandle<'static, GenesisState>`).                                                                                                                                                                                                                                                                                                                                                                              |
-| `wp_cursor_shape_manager_v1` v2        | `wayland::cursor_shape::CursorShapeManagerState`                         | A client-requested shape clears the client-set cursor surface and is recorded; the built-in default arrow is drawn for it (see "Cursor" below). The tablet half of the protocol needs `TabletSeatHandler`, which is implemented as an empty no-op — Genesis advertises **no** tablet global and has no tablet hardware story.                                                                                                                                                                                                                                                                                                                      |
+| Global                                 | Smithay source                                                                                                           | What Genesis does with it                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| -------------------------------------- | ------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `zwlr_layer_shell_v1` v4               | `wayland::shell::wlr_layer::WlrLayerShellState` (`WlrLayerShellHandler`)                                                 | Layer surfaces are mapped into the output's `LayerMap`; the scene's `render_elements_for_output` already renders mapped layers (background/bottom below windows, top/overlay above). A new layer surface gets an initial configure; commits re-arrange the map. **The Shell migrating its chrome onto layer surfaces is a follow-up** — the Shell works today with chrome drawn inside its own surface. Known limitation: pointer/keyboard input is not yet routed to layer surfaces (`input.rs` hit-tests the `Space` only), so a click on a layer surface falls through to the toplevel beneath it; that routing lands with the Shell migration. |
+| `zwlr_foreign_toplevel_manager_v1` v2  | Genesis-implemented (`src/foreign_toplevel.rs`, from `wayland-protocols-wlr` 0.3.12 `foreign_toplevel::v1` server types) | The manager global Smithay 0.7.0 does not ship (see Stage 4 below). On bind, a `toplevel` event per open toplevel (then title / app_id / output_enter / state / done); the same events as toplevels open, close, or change. Requests act on the named toplevel: `activate` (raise + focus), `close` (existing close path), `set_minimized` / `set_maximized` / `set_fullscreen` (+ unsets), `set_rectangle` (minimize hint only). Direct activation of an adopted surface is IGNORED.                                                                                                                                                              |
+| `ext-foreign-toplevel-list-v1` v1      | `wayland::foreign_toplevel_list::ForeignToplevelListState` (Smithay ships it)                                            | Wired alongside the manager (Stage 4 below): one list handle per toplevel, title / app_id updated as they change, `closed` when the toplevel goes away. List-only — no requests.                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| `wp_presentation` v2                   | `wayland::presentation::PresentationState`                                                                               | Feedback is requested per surface and marked `presented` after a frame is actually queued/submitted, with the `CLOCK_MONOTONIC` timestamp, the output's fixed refresh, and the frame sequence number (`render::send_presentation_feedback`). A skipped (empty-damage) frame sends no feedback — content is "presented" only when it reaches the screen.                                                                                                                                                                                                                                                                                            |
+| `wp_viewporter` v1                     | `wayland::viewporter::ViewporterState`                                                                                   | Advertised; no Genesis-side policy (viewporting is applied by the renderer when it imports the surface).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| `wp_content_type_manager_v1` v1        | `wayland::content_type::ContentTypeState`                                                                                | Advertised; the content-type hint is recorded by Smithay and available to the renderer. No Genesis-side policy yet.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| `wp_single_pixel_buffer_manager_v1` v1 | `wayland::single_pixel_buffer::SinglePixelBufferState`                                                                   | Advertised; 1x1 solid-color buffers work as ordinary surface buffers.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| `xdg_activation_v1` v1                 | `wayland::xdg_activation::XdgActivationState` (`XdgActivationHandler`)                                                   | `request_activation` raises the surface's window and gives it keyboard focus, exactly like a pointer press (click-to-focus). Tokens are accepted as-is — there is no Shell focus policy yet to refuse one.                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| `zwp_idle_inhibit_manager_v1` v1       | `wayland::idle_inhibit::IdleInhibitManagerState` (`IdleInhibitHandler`)                                                  | Inhibitors hold the display on (see "Idle / DPMS" below); `IDLE INHIBIT` / `IDLE UNINHIBIT` markers carry the held count.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| `ext_idle_notifier_v1` v2              | `wayland::idle_notify::IdleNotifierState` (`IdleNotifierHandler`)                                                        | Clients get `idled` / `resumed` on their own timeouts; every input event feeds `notify_activity`. The notifier's timers run on a dedicated calloop loop owned by the state (see `idle.rs` — neither backend's loop can supply a `LoopHandle<'static, GenesisState>`).                                                                                                                                                                                                                                                                                                                                                                              |
+| `wp_cursor_shape_manager_v1` v2        | `wayland::cursor_shape::CursorShapeManagerState`                                                                         | A client-requested shape clears the client-set cursor surface and is recorded; the built-in default arrow is drawn for it (see "Cursor" below). The tablet half of the protocol needs `TabletSeatHandler`, which is implemented as an empty no-op — Genesis advertises **no** tablet global and has no tablet hardware story.                                                                                                                                                                                                                                                                                                                      |
 
 **Not added (Stage 4 / follow-ups, per the plan — left out
-deliberately, not forgotten):** foreign-toplevel manager/list
-(Stage 4), pointer-constraints + relative-pointer (Stage 4),
-data-device clipboard (Stage 4), screencopy, input-method +
-text-input, virtual keyboard, tablet, session lock, fractional
-scaling, XWayland. See `COMPOSITOR_PLAN.md`, "Fully equipped".
+deliberately, not forgotten):** pointer-constraints +
+relative-pointer (Stage 4), data-device clipboard (Stage 4),
+screencopy, input-method + text-input, virtual keyboard, tablet,
+session lock, fractional scaling, XWayland. See
+`COMPOSITOR_PLAN.md`, "Fully equipped".
 
 ### Cursor
 
@@ -443,6 +445,303 @@ it. See `compositor/RECOVERY.md`.
   migration (see "Protocols" above); **cursor-shape** renders every
   named shape as the one built-in arrow; **the DPMS timeout** has no
   Settings UI yet (fixed 5 minutes).
+
+## Stage 4 — foreign-toplevel manager + list (manager track)
+
+Stage 4's listing/control side: `ext-foreign-toplevel-list-v1`
+(Smithay ships it) wired alongside a Genesis-implemented
+`zwlr_foreign_toplevel_manager_v1` global (v2). Smithay 0.7.0 has no
+manager module — the gap the plan names honestly — so the global is
+implemented in `src/foreign_toplevel.rs` on top of `wayland-server`,
+from the maintained generated types in `wayland-protocols-wlr`
+0.3.12 (`foreign_toplevel::v1`, server module; added as a direct
+dependency in `Cargo.toml`). The adoption itself — placing a surface
+inside a Browser window — is the adoption track's work and lives in
+its own section, not here.
+
+### What the global offers
+
+- **Listing.** A client that binds the manager gets a `toplevel`
+  event for every open toplevel, each followed by `title`, `app_id`,
+  `output_enter` (the one output), `state`, and `done` — and the
+  same events as toplevels open, close, or change title / app_id /
+  state. The list protocol offers the same toplevels list-only (one
+  handle per toplevel; title / app_id updates; `closed` on close).
+  The sync runs at the end of every `reconcile_surfaces`, so an
+  announcement lags a toplevel's creation by at most one main-loop
+  iteration.
+- **Control.** Handle requests act on the named toplevel:
+  `activate` raises the window and gives it keyboard focus;
+  `close` forwards to the existing close path (`send_close`);
+  `set_maximized` / `unset_maximized` and `set_fullscreen` /
+  `unset_fullscreen` set the corresponding xdg-toplevel state and
+  send a configure (with the output size while set, and the window
+  moved to (0, 0); the previous location is restored when both are
+  unset); `set_minimized` / `unset_minimized` unmaps the window
+  from the scene while minimized (and re-maps it on unminimize)
+  with a configure sent; `set_rectangle` stores a minimize hint.
+  `stop` ends the manager's stream (`finished` is sent back).
+  Every request is logged with a `MANAGER ...` marker (see below).
+  Minimized is contradictory with visible: activating, maximizing,
+  or fullscreening a minimized window restores it first, and
+  unmaximizing / unfullscreening a minimized window leaves it
+  unmapped.
+- **Adopted surfaces.** The manager reports every toplevel,
+  adopted or not, with its app_id / title / state. Direct
+  activation of an adopted surface via the manager is IGNORED
+  (`MANAGER ACTIVATE IGNORED ... adopted`) — adopted surfaces are
+  activated only through their Browser window's focus.
+
+### What it deliberately does NOT do
+
+- **No adoption flag in the protocol** — there is none. The Shell
+  hides adopted surfaces from the window list because the Runtime
+  tells it the toplevel is adopted, not because the manager says
+  so.
+- **No placement.** No manager request can move, resize, reparent,
+  or embed a surface — the protocol has no such request, and
+  `set_rectangle` is a minimize hint only, never placement.
+  Adoption is compositor-internal scene placement, owned by the
+  adoption track.
+- **No minimized xdg state.** xdg-shell defines no minimized state,
+  so minimization is manager-side bookkeeping, reported in the
+  manager `state` array; the configure sent on minimize carries no
+  state change.
+- **No `invalid_rectangle` protocol error.** A `set_rectangle`
+  with a negative width or height is ignored and logged
+  (`MANAGER SET_RECTANGLE INVALID ...`); the protocol error is not
+  posted.
+- **Version 2, not 3.** The upstream XML declares version 3, but
+  v3 only adds the `parent` event, which Genesis never sends, so
+  the global advertises v2 per the plan.
+
+### Adoption seam (resolved at Stage 4 integration)
+
+`GenesisState::is_adopted(surface_id)` is the query the manager
+uses for the ignored-activation rule — and it is the adoption
+track's real registry (`src/adoption.rs`), reading the live
+adoption records, not a manager-owned set. `manager_activate`
+and the xdg-activation handler (`server.rs`) both call the same
+real `is_adopted`. `GenesisState::adopted_browser_window` is
+also defined in `adoption.rs` with the real mapping (surface →
+its Browser window); the manager never calls it — ignoring a
+direct activation needs only `is_adopted`. The seam as the
+manager track originally shipped it (a manager-owned set filled
+by `note_adopted` / `note_released`, stub `adopted_browser_window`
+returning `None`) was removed at integration: it duplicated
+Track 1's registry and the merged tree did not compile until
+the duplicate was deleted.
+
+### Markers
+
+`MANAGER BOUND toplevels=N`, `MANAGER TOPLEVEL id=N app_id=..
+title=..`, `MANAGER TOPLEVEL UPDATE ...`, `MANAGER TOPLEVEL
+CLOSED id=N`, `MANAGER STATE id=N state=..`,
+`MANAGER ACTIVATE id=N` / `MANAGER ACTIVATE IGNORED id=N adopted`
+/ `MANAGER ACTIVATE UNKNOWN id=N`, `MANAGER CLOSE id=N ok=..`,
+`MANAGER MINIMIZE|MAXIMIZE|FULLSCREEN id=N ...=..`,
+`MANAGER SET_RECTANGLE id=N x=.. y=.. width=.. height=..`,
+`MANAGER STOPPED`, `MANAGER UNBOUND`.
+
+### Exercising it
+
+```sh
+# Build the test client with the wlr + ext-list protocol sources (the
+# default build does not generate them; without
+# -DHAVE_WLR_FOREIGN_TOPLEVEL --manager prints an error and exits 1):
+WLR_XML=~/.cargo/registry/src/*/wayland-protocols-wlr-0.3.12/wlr-protocols/unstable/wlr-foreign-toplevel-management-unstable-v1.xml
+LIST_XML=~/.cargo/registry/src/*/wayland-protocols-0.32.13/protocols/staging/ext-foreign-toplevel-list/ext-foreign-toplevel-list-v1.xml
+wayland-scanner client-header "$WLR_XML" wlr-foreign-toplevel-management-unstable-v1-client-protocol.h
+wayland-scanner private-code "$WLR_XML" wlr-foreign-toplevel-management-unstable-v1-protocol.c
+wayland-scanner client-header "$LIST_XML" ext-foreign-toplevel-list-v1-client-protocol.h
+wayland-scanner private-code "$LIST_XML" ext-foreign-toplevel-list-v1-protocol.c
+gcc -DHAVE_WLR_FOREIGN_TOPLEVEL -o sevyn-test-client-manager tests/test-client.c \
+    xdg-shell-protocol.c presentation-time-protocol.c \
+    wlr-foreign-toplevel-management-unstable-v1-protocol.c \
+    ext-foreign-toplevel-list-v1-protocol.c \
+    -I. $(pkg-config --cflags --libs wayland-client)
+
+# List the open toplevels (manager + list protocols):
+WAYLAND_DISPLAY=<socket> ./sevyn-test-client-manager --manager
+# Act on one (env: SEVYN_MANAGER_TARGET_APP_ID, SEVYN_MANAGER_ACTION
+# = activate|close|minimize|unminimize|maximize|unmaximize|
+#   fullscreen|unfullscreen):
+SEVYN_MANAGER_TARGET_APP_ID=sevyn.app SEVYN_MANAGER_ACTION=minimize \
+    WAYLAND_DISPLAY=<socket> ./sevyn-test-client-manager --manager
+# Markers land in /tmp/sevyn-manager-client.log
+# (SEVYN_MANAGER_LOG overrides) and on the console.
+```
+
+### Not yet (manager track, named not claimed)
+
+- **Integrated adopted-activation proof.** The ignored-activation
+  rule is proven end-to-end on the integrated tree by harness A11
+  (`tests/adoption-check.sh`): a really adopted surface's direct
+  manager activation is IGNORED (`MANAGER ACTIVATE IGNORED ...
+adopted`) while its Browser window still activates through the
+  manager. The manager track's stubbed-adoption unit test
+  (`adopted_set_tracks_note_and_release`) was deleted at
+  integration — the seam it tested no longer exists.
+- **The list protocol's proof rides with the manager client.**
+  `--manager` binds `ext-foreign-toplevel-list-v1` too and logs
+  `LIST TOPLEVEL ...` / `LIST CLOSED ...` for the same toplevels,
+  so the list global is proven live by a real client, not only by
+  the compositor's sync. There is no standalone list-only client.
+
+## Stage 4 — adoption (Track 1: adoption core)
+
+Adoption embeds a Chromium window inside a Browser window: the
+Runtime asks the compositor over the bridge socket to place a
+Chromium surface at a rect inside a Browser window, clipped to that
+rect, and the compositor routes pointer and keyboard input to the
+right surface. Identification is by **pid**, not app_id (see
+"Identification" below). The adopted Chromium window is unmapped
+from the `Space` while adopted and rendered explicitly by both
+backends (nested and standalone) at
+(Browser window output position + rect origin), clipped to the rect
+by Smithay's `CropRenderElement` — Chromium pixels never paint
+outside the content area. The placement is computed at render time
+from the Browser window's live position, so a move is structural
+(same frame, no second window), which is the fix for the M13 drag
+drift.
+
+### Runtime bridge: Stage 4 ops
+
+Same socket, same rules as v1 (Unix socket
+`$XDG_RUNTIME_DIR/sevyn-compositor.sock`, mode 0600, newline JSON,
+`{"v": 1, ...}`). The four ops:
+
+```json
+{ "v": 1, "op": "adopt", "session": "<browser-session-id>", "chromium_pid": 1234, "rect": { "x": 0, "y": 152, "w": 800, "h": 348 } }
+{ "v": 1, "op": "move", "session": "...", "rect": { "x": 0, "y": 100, "w": 800, "h": 150 } }
+{ "v": 1, "op": "resize", "session": "...", "rect": { "x": 0, "y": 152, "w": 800, "h": 148 } }
+{ "v": 1, "op": "release", "session": "..." }
+```
+
+- `adopt`: record the adoption. `move`: reposition the adopted
+  element by the rect change in the same frame — no configure is
+  sent to Chromium. `resize`: same as `move`, plus an
+  `xdg_toplevel.configure` with the new content size
+  (rect.w x rect.h). `release`: drop the record; the Chromium window
+  returns to standalone placement (cascade) as its own window.
+- Responses keep the v1 shape:
+  `{"v":1,"ok":true,"op":"...","session":"..."}` /
+  `{"v":1,"ok":false,"op":"...","error":"..."}`. Error strings:
+  `"unknown session"`, `"dead chromium pid"`,
+  `"rect outside browser window"`, `"malformed request"`,
+  `"already adopted"`, `"runtime disconnected"`.
+- Async event, pushed on all connected bridge clients when the
+  adopted Chromium process dies:
+  `{"v":1,"event":"chromium_died","session":"..."}`.
+
+### Auth: `--runtime-pid`
+
+`sevyn-compositor --runtime-pid <pid>` binds the bridge to the
+Runtime's pid (init passes it at launch). When set, the bridge
+admits **only** that pid (`SO_PEERCRED` pid check; a wrong pid gets
+EOF and a `bridge: rejected a connection from pid=...` diagnostic).
+When unset, the Stage 2/3 same-uid auth applies. The `READY` marker
+reports `runtime_pid=<pid|(any same-uid)>`.
+
+The standalone backend registers one calloop source per live
+bridge connection (`sync_bridge_sources` in `drm.rs`, dups from
+`BridgeServer::connection_watch_fds`), so a request on an existing
+connection wakes the loop in the round it arrives. The listener fd
+alone only fires on _new_ connections — without the per-connection
+sources a request sat until some other source (a pointer move, a
+client message) happened to fire the loop, and every bridge request
+timed out at the Runtime. The nested backend does not need this: it
+pumps every 2 ms, so `bridge.poll` runs continuously there.
+
+### Identification
+
+By pid (`wl_client_get_credentials` on the toplevel's `wl_surface`),
+never by app_id. app_id (`chromium`) is a sanity check only: a
+mismatch is logged as a diagnostic and never blocks adoption, and a
+client claiming app_id `chromium` with the wrong pid is never
+adopted, because the pid match fails first. Chromium pid liveness is
+also checked with `kill(pid, 0)` at adopt time. Adopting the Browser
+window into itself (chromium_pid == the Browser's pid) is rejected
+as `"malformed request"`.
+
+### Focus policy (adoption)
+
+- Pointer hit-test runs adoption-first: a position inside the
+  content rect hits the adopted Chromium surface; elsewhere in the
+  window it hits the Browser chrome surfaces (normal `Space`
+  hit-test).
+- Click content → the Chromium surface gets keyboard focus; the
+  Browser toplevel stays `Activated`. Click chrome → the Browser
+  app. A press raises the Browser window, never the adopted
+  toplevel alone. Keyboard focus is click-to-focus only — hover
+  never moves it (the Stage 2 rule stands; the plan's "pointer over
+  the content rect" line is implemented as click-to-focus, see
+  "Plan ambiguities" below).
+- The adopted toplevel is never activated except through the Browser
+  window's focus. Activation requests for adopted surfaces that did
+  not come via the Browser window are ignored, including
+  xdg-activation (`ACTIVATION IGNORED adopted surface=<id>` in the
+  log); the manager track routes its activate through
+  `is_adopted`.
+
+### Lifecycle
+
+- **Chromium dies** → the adoption is removed, the Runtime is
+  notified with the `chromium_died` event, the Browser window stays
+  open (`ADOPTION CHROMIUM DIED session=... chromium=... pid=...`).
+- **Browser closes** → the adoption is dropped
+  (`ADOPTION DROPPED session=... reason=browser-closed`) and the
+  adopted Chromium is asked to close with it — a close is not a
+  release (release is the only path that leaves the Chromium as a
+  standalone window).
+- **Runtime dies** → the compositor keeps presenting the last scene
+  and refuses new adoptions until the Runtime reconnects
+  (`RUNTIME DISCONNECTED degraded: refusing new adoptions until the
+Runtime reconnects`, `RUNTIME RECONNECTED` on reconnect). The
+  degraded state only fires after a connection has existed; a
+  connection that never connected is not a disconnect.
+- **No separate `register` op exists in v1.** "The Runtime
+  reconnects and re-registers" is implemented as: the bridge
+  (re)connection itself is the re-registration.
+
+### Markers
+
+`ADOPTION ADOPTED session=... browser=... chromium=... pid=...
+rect=x,y,w,h`, `ADOPTION MOVED ...`, `ADOPTION RESIZED ...
+size=WxH rect=...`, `ADOPTION RELEASED session=...
+chromium=...`, `ADOPTION CHROMIUM DIED ...`,
+`ADOPTION DROPPED ... reason=browser-closed`,
+`RUNTIME DISCONNECTED ...`, `RUNTIME RECONNECTED ...`,
+`ACTIVATION IGNORED adopted surface=...`.
+
+### Plan ambiguities (Stage 4, recorded — not silently resolved)
+
+1. **No `register` op.** See "Lifecycle" above: (re)connection is
+   the re-registration.
+2. **Hover vs keyboard focus.** Click-to-focus only; hover never
+   moves keyboard focus.
+3. **No window-move API exists** in Stage 2/3, so "Browser window
+   moves → same delta, same frame" can only be exercised via the
+   bridge `move` op (a rect change), not via an actual `Space`
+   relocation. The derived-location design makes both the same
+   render-time code path.
+
+### Proof (Track 1)
+
+- Nested (sandbox, `compositor/tests/nested-check.sh` PASS plus a
+  throwaway harness, 59/59 checks): all hostile adopt cases, valid
+  adopt, already-adopted, move (hit-test follows the new rect, no
+  configure sent), resize (configure 800x148 received), clipping by
+  pixels, focus routing both ways, Chromium-death event + Browser
+  survival, `--runtime-pid` rejection + degraded/reconnect,
+  release (standalone repaint, keys, re-adopt), Browser close
+  drops the adoption, clean shutdown, no orphans. Proof logs in
+  `~/workspace/stage4-adoption-proof/`.
+- Standalone (KVM box, QEMU virtio-gpu): same sequence driven
+  through the bridge with QMP pointer/keys and screendump pixels —
+  see `ACCEPTANCE.md`.
+- **Not proven:** real Shell/Chromium embedding is sevynos-side
+  Stage 5 work; GF65 hardware proof is owed.
 
 ## Build
 

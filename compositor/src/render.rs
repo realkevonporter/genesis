@@ -12,13 +12,14 @@ use smithay::{
         element::{
             memory::MemoryRenderBufferRenderElement,
             surface::{render_elements_from_surface_tree, WaylandSurfaceRenderElement},
-            Kind, Wrap,
+            utils::CropRenderElement,
+            Element, Id, Kind, Wrap,
         },
         ImportAll, ImportDmaWl, ImportMem, ImportMemWl, Renderer,
     },
-    desktop::{layer_map_for_output, PopupManager},
+    desktop::{layer_map_for_output, PopupManager, Window},
     reexports::wayland_server::protocol::wl_surface::WlSurface,
-    utils::{Logical, Physical, Point, Size},
+    utils::{Logical, Physical, Point, Rectangle, Scale, Size},
     wayland::{
         compositor::{with_surface_tree_downward, SurfaceAttributes, TraversalAction},
         presentation::{PresentationFeedbackCachedState, Refresh},
@@ -47,6 +48,154 @@ smithay::backend::renderer::element::render_elements! {
     Surface=WaylandSurfaceRenderElement<R>,
     Wrapped=Wrap<WaylandSurfaceRenderElement<R>>,
     Memory=MemoryRenderBufferRenderElement<R>,
+    /// A surface element clipped to its adoption rect (Stage 4).
+    Cropped=CropRenderElement<WaylandSurfaceRenderElement<R>>,
+}
+
+// The render-element type for the nested (winit) backend: the scene's
+// surface elements plus the clipped adopted elements. The nested
+// backend draws no memory-backed cursor (the parent compositor draws
+// it), so there is no `Memory` variant here — the only difference
+// from `DrmRenderElements`. (A plain comment, not a doc comment:
+// rustdoc does not generate documentation for macro invocations.)
+smithay::backend::renderer::element::render_elements! {
+    pub NestedRenderElements<R> where R: ImportAll + ImportMem + ImportMemWl + ImportDmaWl;
+    Surface=WaylandSurfaceRenderElement<R>,
+    Wrapped=Wrap<WaylandSurfaceRenderElement<R>>,
+    /// A surface element clipped to its adoption rect (Stage 4).
+    Cropped=CropRenderElement<WaylandSurfaceRenderElement<R>>,
+}
+
+/// The clipped render elements for every live adoption, one entry per
+/// Browser window: the Browser window (for stacking — see
+/// [`splice_adopted`]) and the adopted Chromium surface's elements,
+/// placed at the Browser window's output position plus the rect origin
+/// and cropped to the rect (global compositor coordinates, scaled to
+/// physical pixels by `scale`).
+///
+/// An adoption whose Browser window is not mapped, or whose Chromium
+/// surface has not committed a buffer yet, contributes an empty
+/// element list — it renders nothing this frame, and renders the
+/// moment the surface commits.
+pub fn adopted_elements<R: Renderer + ImportAll>(
+    state: &GenesisState,
+    renderer: &mut R,
+    scale: f64,
+) -> Vec<(
+    Window,
+    Vec<CropRenderElement<WaylandSurfaceRenderElement<R>>>,
+)>
+where
+    R::TextureId: Clone + 'static,
+{
+    let mut out = Vec::new();
+    for adoption in state.adoptions.clone() {
+        let Some(browser) = state
+            .registry
+            .get(adoption.browser_surface_id)
+            .map(|record| record.window.clone())
+        else {
+            continue;
+        };
+        let Some(chromium) = state
+            .registry
+            .get(adoption.chromium_surface_id)
+            .map(|record| record.toplevel.wl_surface().clone())
+        else {
+            continue;
+        };
+        let Some(location) = state.adopted_location(&adoption) else {
+            out.push((browser, Vec::new()));
+            continue;
+        };
+        let Some(clip) = state.adopted_global_rect(&adoption) else {
+            out.push((browser, Vec::new()));
+            continue;
+        };
+        // Logical → physical: the element location and the crop rect
+        // are both scaled by the output scale, so they agree in the
+        // physical space `CropRenderElement::from_element` expects.
+        let physical_location = Point::<i32, Physical>::from((
+            (location.x as f64 * scale) as i32,
+            (location.y as f64 * scale) as i32,
+        ));
+        let physical_clip = Rectangle::<i32, Physical>::new(
+            Point::from((
+                (clip.loc.x as f64 * scale) as i32,
+                (clip.loc.y as f64 * scale) as i32,
+            )),
+            Size::from((
+                (clip.size.w as f64 * scale) as i32,
+                (clip.size.h as f64 * scale) as i32,
+            )),
+        );
+        let elements = render_elements_from_surface_tree(
+            renderer,
+            &chromium,
+            physical_location,
+            scale,
+            1.0,
+            Kind::Unspecified,
+        );
+        let cropped: Vec<CropRenderElement<WaylandSurfaceRenderElement<R>>> = elements
+            .into_iter()
+            .filter_map(|element| {
+                CropRenderElement::from_element(element, Scale::from(scale), physical_clip)
+            })
+            .collect();
+        out.push((browser, cropped));
+    }
+    out
+}
+
+/// Splice each adoption's clipped elements into the scene's element
+/// list immediately above its Browser window's own elements, so the
+/// adopted content renders above the Browser chrome it sits inside
+/// and below any window stacked above the Browser window.
+///
+/// The list `render_elements_for_output` returns is front-to-back
+/// (`draw_render_elements` reverses it before drawing, so the first
+/// element in the list is drawn last — on top). "Above the Browser
+/// window" therefore means *before* the Browser window's first
+/// element in the list, after the elements of any window stacked
+/// above it. The Browser window's elements are identified by the
+/// Wayland-resource ids of its surface tree (a surface element's
+/// [`Element::id`] is `Id::from_wayland_resource` of its
+/// `wl_surface`). An adoption whose Browser window currently
+/// contributes no elements (no buffer committed yet) goes at the
+/// front instead — topmost until the Browser window commits and the
+/// next render splices it into place.
+pub fn splice_adopted<E: Element>(mut elements: Vec<E>, adopted: Vec<(Window, Vec<E>)>) -> Vec<E> {
+    for (browser, adopted_elements) in adopted {
+        if adopted_elements.is_empty() {
+            continue;
+        }
+        let browser_ids = browser_surface_ids(&browser);
+        let insert_at = elements
+            .iter()
+            .position(|element| browser_ids.contains(element.id()))
+            .unwrap_or(0);
+        elements.splice(insert_at..insert_at, adopted_elements);
+    }
+    elements
+}
+
+/// The Wayland-resource ids of every surface in a window's tree
+/// (toplevel + subsurfaces), for [`splice_adopted`].
+fn browser_surface_ids(window: &Window) -> Vec<Id> {
+    use smithay::wayland::compositor::get_children;
+    let Some(surface) = window.wl_surface().map(|surface| surface.into_owned()) else {
+        return Vec::new();
+    };
+    let mut ids = vec![Id::from_wayland_resource(&surface)];
+    let mut stack = vec![surface];
+    while let Some(parent) = stack.pop() {
+        for child in get_children(&parent) {
+            ids.push(Id::from_wayland_resource(&child));
+            stack.push(child);
+        }
+    }
+    ids
 }
 
 /// Send `wl_surface.frame` callbacks for a surface tree (copied from
@@ -100,6 +249,22 @@ where
             continue;
         };
         collect_popups(renderer, &wl_surface, window_location, scale, &mut elements);
+    }
+    // Popups of adopted Chromium windows: the adopted window is not
+    // in the Space (see `adoption.rs`), so its popups are collected
+    // here at the adopted location instead.
+    for adoption in state.adoptions.clone() {
+        let Some(chromium) = state
+            .registry
+            .get(adoption.chromium_surface_id)
+            .and_then(|record| record.window.wl_surface())
+        else {
+            continue;
+        };
+        let Some(location) = state.adopted_location(&adoption) else {
+            continue;
+        };
+        collect_popups(renderer, &chromium, location, scale, &mut elements);
     }
     // Popups whose parent is a layer surface (dock menus, panel
     // popups): the layer's arranged geometry is its location.
