@@ -61,6 +61,23 @@
 //!   is over the content rect, keys go to the page" that is consistent
 //!   with the hover rule; see `compositor/README.md` for the
 //!   ambiguity note.
+//!
+//! ## Layer surfaces (the Shell migration)
+//!
+//! The Shell is a layer-shell `Background` surface, not a toplevel —
+//! so it can never be raised above app windows (it is not in the
+//! `Space` at all). The hit-test runs in stacking order: `Overlay`
+//! and `Top` layers first, then the `Space` (toplevels, adoption
+//! first), then `Bottom` and `Background` layers. A press on a layer
+//! surface never raises anything; when the layer can receive keyboard
+//! focus (`Exclusive` / `OnDemand` interactivity) the press moves
+//! keyboard focus to it (see `GenesisState::set_keyboard_focus_layer`)
+//! and clears the `Activated` state on every toplevel. A press on
+//! empty space still leaves keyboard focus unchanged.
+//!
+//! Pointer motion, scroll, and touch motion route to the leaf surface
+//! under the pointer whatever it is — toplevel or layer — through the
+//! same [`hit_test`].
 
 use smithay::{
     backend::{
@@ -72,7 +89,7 @@ use smithay::{
         libinput::LibinputInputBackend,
         winit::WinitInput,
     },
-    desktop::{Window, WindowSurfaceType},
+    desktop::{layer_map_for_output, LayerSurface, Window, WindowSurfaceType},
     input::{
         keyboard::FilterResult,
         pointer::{AxisFrame, ButtonEvent, MotionEvent},
@@ -80,6 +97,7 @@ use smithay::{
     },
     reexports::wayland_server::protocol::wl_surface::WlSurface,
     utils::{Logical, Physical, Point, Raw, Serial, Size, Transform},
+    wayland::shell::wlr_layer::Layer as WlrLayer,
 };
 
 use crate::{diag, marker, server::GenesisState};
@@ -110,18 +128,53 @@ fn clamp_to_output(state: &GenesisState, location: Point<f64, Logical>) -> Point
     ))
 }
 
-/// Hit-test the pointer location against the scene. Returns the window,
-/// the leaf surface under the pointer, and the leaf surface's origin in
-/// **global compositor space** — or `None` when the pointer is over
-/// empty space.
+/// What the pointer hit: a toplevel window in the `Space`, or a layer
+/// surface in the output's `LayerMap`. A layer hit never raises (layers
+/// are not in the `Space`) and never carries a registry id — the
+/// pointer/keyboard focus ids stay `None` for it, and markers report
+/// its namespace instead.
+enum HitTarget {
+    Window(Window),
+    Layer(LayerSurface),
+}
+
+/// Hit-test one layer of the output's `LayerMap` (topmost surface on
+/// that layer first). Returns the layer surface, the leaf surface under
+/// the pointer, and the leaf surface's origin in **global compositor
+/// space** — or `None` when the pointer is over no surface on that
+/// layer.
+fn layer_hit_test(
+    state: &GenesisState,
+    location: Point<f64, Logical>,
+    layer: WlrLayer,
+) -> Option<(LayerSurface, WlSurface, Point<i32, Logical>)> {
+    let layer_map = layer_map_for_output(&state.output);
+    let surface = layer_map.layer_under(layer, location)?;
+    let geometry = layer_map.layer_geometry(surface)?;
+    let layer_point = location - geometry.loc.to_f64();
+    let (leaf, leaf_location) = surface.surface_under(layer_point, WindowSurfaceType::ALL)?;
+    Some((surface.clone(), leaf, geometry.loc + leaf_location))
+}
+
+/// Hit-test the pointer location against the scene. Returns the hit
+/// target, the leaf surface under the pointer, and the leaf surface's
+/// origin in **global compositor space** — or `None` when the pointer
+/// is over empty space.
 ///
-/// Stage 4 (adoption) runs first: a position inside a Browser window's
-/// adopted content rect hits the adopted Chromium surface; anywhere
-/// else in the window it hits the Browser chrome surfaces (the normal
-/// `Space` hit-test below — the adopted window is not in the `Space`,
-/// so the space test can only ever return the Browser window there).
-/// The adopted window's location is its Browser window's output
-/// position plus the rect origin, computed from the live scene.
+/// Stacking order (topmost first): `Overlay` and `Top` layers, then
+/// the `Space` (toplevels, adoption first — see below), then `Bottom`
+/// and `Background` layers. The Shell is a `Background` layer, so a
+/// click on empty desktop hits it last and can never raise it above an
+/// app window; a click on an app window hits the window first.
+///
+/// Stage 4 (adoption) runs first inside the `Space` test: a position
+/// inside a Browser window's adopted content rect hits the adopted
+/// Chromium surface; anywhere else in the window it hits the Browser
+/// chrome surfaces (the normal `Space` hit-test below — the adopted
+/// window is not in the `Space`, so the space test can only ever
+/// return the Browser window there). The adopted window's location is
+/// its Browser window's output position plus the rect origin, computed
+/// from the live scene.
 ///
 /// The global origin is what Smithay's input handles expect:
 /// `PointerHandle::motion` and `TouchHandle::down` both document the
@@ -133,7 +186,13 @@ fn clamp_to_output(state: &GenesisState, location: Point<f64, Logical>) -> Point
 fn hit_test(
     state: &GenesisState,
     location: Point<f64, Logical>,
-) -> Option<(Window, WlSurface, Point<i32, Logical>)> {
+) -> Option<(HitTarget, WlSurface, Point<i32, Logical>)> {
+    // Layers above windows first.
+    for layer in [WlrLayer::Overlay, WlrLayer::Top] {
+        if let Some((surface, leaf, origin)) = layer_hit_test(state, location, layer) {
+            return Some((HitTarget::Layer(surface), leaf, origin));
+        }
+    }
     for adoption in state.adoptions.clone() {
         let Some(rect) = state.adopted_global_rect(&adoption) else {
             continue;
@@ -158,12 +217,31 @@ fn hit_test(
         let window_point = location - adopted_location.to_f64();
         let (surface, surface_location) =
             chromium.surface_under(window_point, WindowSurfaceType::ALL)?;
-        return Some((chromium, surface, adopted_location + surface_location));
+        return Some((
+            HitTarget::Window(chromium),
+            surface,
+            adopted_location + surface_location,
+        ));
     }
-    let (window, window_location) = state.space.element_under(location)?;
-    let window_point = location - window_location.to_f64();
-    let (surface, surface_location) = window.surface_under(window_point, WindowSurfaceType::ALL)?;
-    Some((window.clone(), surface, window_location + surface_location))
+    if let Some((window, window_location)) = state.space.element_under(location) {
+        let window_point = location - window_location.to_f64();
+        if let Some((surface, surface_location)) =
+            window.surface_under(window_point, WindowSurfaceType::ALL)
+        {
+            return Some((
+                HitTarget::Window(window.clone()),
+                surface,
+                window_location + surface_location,
+            ));
+        }
+    }
+    // Layers below windows last.
+    for layer in [WlrLayer::Bottom, WlrLayer::Background] {
+        if let Some((surface, leaf, origin)) = layer_hit_test(state, location, layer) {
+            return Some((HitTarget::Layer(surface), leaf, origin));
+        }
+    }
+    None
 }
 
 /// The click-to-focus target for a pressed window: an adopted Chromium
@@ -205,24 +283,32 @@ pub fn pointer_motion(
     let hit = hit_test(state, location);
     let focus = hit
         .as_ref()
-        .map(|(_window, surface, surface_location)| (surface.clone(), surface_location.to_f64()));
+        .map(|(_target, surface, surface_location)| (surface.clone(), surface_location.to_f64()));
     // Pointer focus is reported against the toplevel record that owns
     // the leaf surface under the pointer (subsurfaces are not registry
-    // entries; the window is).
-    let focus_id = hit.as_ref().and_then(|(window, _, _)| {
-        state
-            .registry
-            .records()
-            .iter()
-            .find(|record| record.window == *window)
-            .map(|record| record.id)
-    });
-    if focus_id != state.pointer_focus_id {
+    // entries; the window is). A layer hit has no registry record, so
+    // the id stays `None` and the marker reports the layer namespace.
+    let (focus_id, focus_layer) = match &hit {
+        Some((HitTarget::Window(window), _, _)) => (
+            state
+                .registry
+                .records()
+                .iter()
+                .find(|record| record.window == *window)
+                .map(|record| record.id),
+            None,
+        ),
+        Some((HitTarget::Layer(layer), _, _)) => (None, Some(layer.namespace().to_string())),
+        None => (None, None),
+    };
+    if focus_id != state.pointer_focus_id || focus_layer != state.pointer_focus_layer {
         state.pointer_focus_id = focus_id;
+        state.pointer_focus_layer = focus_layer.clone();
         marker!(
             "POINTER FOCUS surface={} x={} y={}",
             focus_id
                 .map(|id| id.to_string())
+                .or_else(|| focus_layer.map(|namespace| format!("layer={namespace}")))
                 .unwrap_or_else(|| "(none)".to_string()),
             location.x as i32,
             location.y as i32
@@ -246,6 +332,11 @@ pub fn pointer_motion(
 /// Browser toplevel (see `GenesisState::focus_adopted`). A press on
 /// the chrome focuses the Browser app. The adopted toplevel is never
 /// raised or activated on its own.
+///
+/// A press on a layer surface never raises anything (layers are not
+/// in the `Space`): when the layer can receive keyboard focus it
+/// takes it (see `GenesisState::set_keyboard_focus_layer`); a layer
+/// that never wants keys leaves keyboard focus where it is.
 pub fn pointer_button(
     state: &mut GenesisState,
     button: u32,
@@ -255,25 +346,41 @@ pub fn pointer_button(
 ) {
     state.note_input_activity();
     if button_state == ButtonState::Pressed {
-        if let Some((window, _surface, _location)) = hit_test(state, state.pointer_location) {
-            let (raise, adopted) = focus_target(state, &window);
-            state.space.raise_element(&raise, true);
-            match adopted {
-                Some(chromium) => state.focus_adopted(&raise, &chromium),
-                None => state.set_keyboard_focus(Some(&raise)),
+        match hit_test(state, state.pointer_location) {
+            Some((HitTarget::Window(window), _surface, _location)) => {
+                let (raise, adopted) = focus_target(state, &window);
+                state.space.raise_element(&raise, true);
+                match adopted {
+                    Some(chromium) => state.focus_adopted(&raise, &chromium),
+                    None => state.set_keyboard_focus(Some(&raise)),
+                }
             }
+            Some((HitTarget::Layer(layer), surface, _)) if layer.can_receive_keyboard_focus() => {
+                state.set_keyboard_focus_layer(Some(&surface));
+            }
+            // A layer that never wants keys: the press still goes to
+            // the layer surface (via pointer focus), but keyboard
+            // focus stays where it is.
+            Some((HitTarget::Layer(..), _, _)) => {}
+            None => {}
         }
     }
-    let surface_id = state.pointer_focus_id;
+    let surface_label = state
+        .pointer_focus_id
+        .map(|id| id.to_string())
+        .or_else(|| {
+            state
+                .pointer_focus_layer
+                .as_ref()
+                .map(|namespace| format!("layer={namespace}"))
+        })
+        .unwrap_or_else(|| "(none)".to_string());
     marker!(
-        "POINTER BUTTON button={button} state={} surface={}",
+        "POINTER BUTTON button={button} state={} surface={surface_label}",
         match button_state {
             ButtonState::Pressed => "pressed",
             ButtonState::Released => "released",
         },
-        surface_id
-            .map(|id| id.to_string())
-            .unwrap_or_else(|| "(none)".to_string())
     );
     let event = ButtonEvent {
         button,
@@ -379,7 +486,9 @@ pub fn dispatch_input_event(state: &mut GenesisState, event: InputEvent<WinitInp
 /// Route a touch-down event: same rule as a pointer press — raise the
 /// window under the touch point and move keyboard focus to it
 /// (click-to-focus), then deliver the touch to the leaf surface under
-/// the point. A touch on empty space delivers to no surface.
+/// the point. A touch on a layer surface focuses it when it can
+/// receive keyboard focus (a layer is never raised). A touch on empty
+/// space delivers to no surface.
 pub fn touch_down(
     state: &mut GenesisState,
     location: Point<f64, Logical>,
@@ -389,30 +498,41 @@ pub fn touch_down(
 ) {
     state.note_input_activity();
     let hit = hit_test(state, location);
-    if let Some((window, _, _)) = &hit {
-        let (raise, adopted) = focus_target(state, window);
-        state.space.raise_element(&raise, true);
-        match adopted {
-            Some(chromium) => state.focus_adopted(&raise, &chromium),
-            None => state.set_keyboard_focus(Some(&raise)),
+    match &hit {
+        Some((HitTarget::Window(window), _, _)) => {
+            let (raise, adopted) = focus_target(state, window);
+            state.space.raise_element(&raise, true);
+            match adopted {
+                Some(chromium) => state.focus_adopted(&raise, &chromium),
+                None => state.set_keyboard_focus(Some(&raise)),
+            }
         }
+        Some((HitTarget::Layer(layer), surface, _)) if layer.can_receive_keyboard_focus() => {
+            state.set_keyboard_focus_layer(Some(surface));
+        }
+        // A layer that never wants keys: the touch still goes to the
+        // layer surface, but keyboard focus stays where it is.
+        Some((HitTarget::Layer(..), _, _)) => {}
+        None => {}
     }
     let focus = hit
         .as_ref()
-        .map(|(_window, surface, surface_location)| (surface.clone(), surface_location.to_f64()));
+        .map(|(_target, surface, surface_location)| (surface.clone(), surface_location.to_f64()));
     marker!(
         "TOUCH DOWN slot={:?} x={} y={} surface={}",
         slot,
         location.x as i32,
         location.y as i32,
         hit.as_ref()
-            .and_then(|(window, _, _)| state
-                .registry
-                .records()
-                .iter()
-                .find(|record| record.window == *window)
-                .map(|record| record.id))
-            .map(|id| id.to_string())
+            .and_then(|(target, _, _)| match target {
+                HitTarget::Window(window) => state
+                    .registry
+                    .records()
+                    .iter()
+                    .find(|record| record.window == *window)
+                    .map(|record| record.id.to_string()),
+                HitTarget::Layer(layer) => Some(format!("layer={}", layer.namespace())),
+            })
             .unwrap_or_else(|| "(none)".to_string())
     );
     let event = DownEvent {
@@ -440,7 +560,7 @@ pub fn touch_motion(
 ) {
     state.note_input_activity();
     let focus = hit_test(state, location)
-        .map(|(_window, surface, surface_location)| (surface, surface_location.to_f64()));
+        .map(|(_target, surface, surface_location)| (surface, surface_location.to_f64()));
     let event = TouchMotion {
         slot,
         location,

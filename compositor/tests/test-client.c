@@ -66,6 +66,26 @@
  * `MANAGER ACTIVATE|CLOSE|MINIMIZE|MAXIMIZE|FULLSCREEN app_id=..`,
  * `LIST TOPLEVEL identifier=.. title=.. app_id=..`, `LIST CLOSED ...`,
  * `MANAGER DONE`.
+ *
+ * Window-raise fix: `--layer` mode (a separate entry point, same
+ * pattern as `--manager`) binds `zwlr_layer_shell_v1`, creates one
+ * fullscreen Background layer surface, and logs every pointer/keyboard
+ * event it receives with a LAYER prefix — the proof that Genesis routes
+ * input to layer surfaces. It needs the wlr layer-shell protocol
+ * sources generated at build time
+ * (`wlr-layer-shell-unstable-v1.xml` from the wayland-protocols-wlr
+ * crate, `/usr/share/wayland-protocols` fallback) and
+ * `-DHAVE_WLR_LAYER_SHELL`; without the define the default build is
+ * unchanged and `--layer` prints an error. Env:
+ *   SEVYN_LAYER_LOG        default /tmp/sevyn-layer-client.log
+ *   SEVYN_LAYER_NAMESPACE  default "sevyn-test-layer"
+ *   SEVYN_LAYER_WIDTH      default 1280
+ *   SEVYN_LAYER_HEIGHT     default 800
+ * Markers: `LAYER READY width=.. height=..` (first configure),
+ * `LAYER CONFIGURE width=.. height=..` (every configure — the size is
+ * corrected by a second configure after the first commit),
+ * `LAYER PTR ENTER x=.. y=..`, `LAYER PTR BUTTON button=.. state=..`,
+ * `LAYER KEY FOCUS`, `LAYER KEY key=.. state=..`, `LAYER CLOSED`.
  */
 #define _GNU_SOURCE
 #include <errno.h>
@@ -88,6 +108,9 @@
 #ifdef HAVE_WLR_FOREIGN_TOPLEVEL
 #include "wlr-foreign-toplevel-management-unstable-v1-client-protocol.h"
 #include "ext-foreign-toplevel-list-v1-client-protocol.h"
+#endif
+#ifdef HAVE_WLR_LAYER_SHELL
+#include "wlr-layer-shell-unstable-v1-client-protocol.h"
 #endif
 #ifdef SEVYN_HAVE_POINTER_CONSTRAINTS
 #include "pointer-constraints-unstable-v1-client-protocol.h"
@@ -1534,6 +1557,448 @@ static int run_manager_mode(void)
 
 #endif /* HAVE_WLR_FOREIGN_TOPLEVEL */
 
+/* --- --layer mode (window-raise fix) ---------------------------------- */
+/* Kept in its own functions, separate from the M1 client above: this
+ * client binds zwlr_layer_shell_v1, creates one fullscreen Background
+ * layer surface (namespace SEVYN_LAYER_NAMESPACE, default
+ * "sevyn-test-layer") with Exclusive keyboard interactivity, and logs
+ * every pointer/keyboard event it receives with a LAYER prefix — the
+ * proof that Genesis routes input to layer surfaces. It creates no
+ * toplevel, so it sits below every window in the scene exactly like
+ * the Shell will once it migrates to a layer-shell background.
+ * Guarded by HAVE_WLR_LAYER_SHELL so the default build (which does
+ * not generate the wlr layer-shell protocol sources) is unaffected.
+ * Env:
+ *   SEVYN_LAYER_LOG        default /tmp/sevyn-layer-client.log
+ *   SEVYN_LAYER_NAMESPACE  default "sevyn-test-layer"
+ *   SEVYN_LAYER_WIDTH      default 1280
+ *   SEVYN_LAYER_HEIGHT     default 800
+ * Markers (same log file + console): `LAYER READY width=.. height=..`
+ * (first configure), `LAYER CONFIGURE width=.. height=..` (every
+ * configure — the size is corrected by a second configure after the
+ * first commit, see layer_configure), `LAYER PTR ENTER x=.. y=..`,
+ * `LAYER PTR LEAVE`, `LAYER PTR BUTTON button=.. state=..`,
+ * `LAYER KEY FOCUS`, `LAYER KEY LEAVE`,
+ * `LAYER KEY key=.. state=..`, `LAYER CLOSED`. */
+#ifdef HAVE_WLR_LAYER_SHELL
+
+struct layer_app {
+    struct wl_display *display;
+    struct wl_registry *registry;
+    struct wl_compositor *compositor;
+    struct wl_shm *shm;
+    struct wl_seat *seat;
+    struct wl_pointer *pointer;
+    struct wl_keyboard *keyboard;
+    struct zwlr_layer_shell_v1 *layer_shell;
+    struct zwlr_layer_surface_v1 *layer_surface;
+    struct wl_surface *surface;
+    struct wl_buffer *buffer;
+    int width, height;
+    bool configured;
+    bool closed;
+};
+
+static int layer_getenv_int(const char *name, int def)
+{
+    const char *v = getenv(name);
+    if (!v || !*v)
+        return def;
+    int n = atoi(v);
+    return n > 0 ? n : def;
+}
+
+/* Dispatch Wayland events for up to `ms` milliseconds, then return.
+ * (Same shape as manager_dispatch_for_ms, which lives under the
+ * foreign-toplevel guard and is not visible here.) */
+static void layer_dispatch_for_ms(struct wl_display *display, int ms)
+{
+    long long deadline = now_ms() + ms;
+    int fd = wl_display_get_fd(display);
+    for (;;) {
+        if (wl_display_dispatch_pending(display) < 0)
+            return;
+        long long remaining = deadline - now_ms();
+        if (remaining <= 0)
+            break;
+        struct pollfd pfd = { .fd = fd, .events = POLLIN };
+        int r = poll(&pfd, 1, (int)remaining);
+        if (r < 0) {
+            if (errno == EINTR)
+                continue;
+            return;
+        }
+        if (r > 0 && (pfd.revents & (POLLIN | POLLERR | POLLHUP))) {
+            if (wl_display_dispatch(display) < 0)
+                return;
+        }
+    }
+    wl_display_dispatch_pending(display);
+}
+
+static struct wl_buffer *layer_make_buffer(struct layer_app *app, int w, int h,
+                                           uint32_t color)
+{
+    int size = w * h * 4;
+    int fd = memfd_create("sevyn-layer-shm", MFD_CLOEXEC);
+    if (fd < 0) {
+        log_line("LAYER error: memfd_create failed: %s", strerror(errno));
+        return NULL;
+    }
+    if (ftruncate(fd, size) < 0) {
+        log_line("LAYER error: ftruncate failed: %s", strerror(errno));
+        close(fd);
+        return NULL;
+    }
+    uint32_t *pixels = mmap(NULL, (size_t)size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (pixels == MAP_FAILED) {
+        log_line("LAYER error: mmap failed: %s", strerror(errno));
+        close(fd);
+        return NULL;
+    }
+    for (int i = 0; i < w * h; i++)
+        pixels[i] = color;
+    munmap(pixels, (size_t)size);
+    struct wl_shm_pool *pool = wl_shm_create_pool(app->shm, fd, size);
+    struct wl_buffer *buf = wl_shm_pool_create_buffer(pool, 0, w, h, w * 4,
+                                                      WL_SHM_FORMAT_XRGB8888);
+    wl_shm_pool_destroy(pool);
+    close(fd);
+    return buf;
+}
+
+/* --- layer-surface events --- */
+
+static void layer_configure(void *data, struct zwlr_layer_surface_v1 *layer_surface,
+                            uint32_t serial, uint32_t width, uint32_t height)
+{
+    struct layer_app *app = data;
+    zwlr_layer_surface_v1_ack_configure(layer_surface, serial);
+    /* Log every configure, not just the first: the initial configure
+     * predates the client's set_size (the compositor sends it from
+     * new_layer_surface before the request is even read), so the size
+     * is corrected by a second configure after the first commit — the
+     * harness waits for the corrected size. */
+    log_line("LAYER CONFIGURE width=%u height=%u", width, height);
+    if (width == 0 || height == 0)
+        return;
+    if (app->configured && app->width == (int)width && app->height == (int)height)
+        return;
+    if (app->buffer) {
+        wl_buffer_destroy(app->buffer);
+        app->buffer = NULL;
+    }
+    app->width = (int)width;
+    app->height = (int)height;
+    app->buffer = layer_make_buffer(app, app->width, app->height, 0xFF282828);
+    if (!app->buffer) {
+        log_line("LAYER error: could not make a %dx%d buffer", app->width, app->height);
+        return;
+    }
+    wl_surface_attach(app->surface, app->buffer, 0, 0);
+    wl_surface_commit(app->surface);
+    if (!app->configured) {
+        app->configured = true;
+        log_line("LAYER READY width=%d height=%d", app->width, app->height);
+    }
+}
+
+static void layer_closed(void *data, struct zwlr_layer_surface_v1 *layer_surface)
+{
+    struct layer_app *app = data;
+    (void)layer_surface;
+    app->closed = true;
+    log_line("LAYER CLOSED");
+}
+
+static const struct zwlr_layer_surface_v1_listener layer_surface_listener = {
+    .configure = layer_configure,
+    .closed = layer_closed,
+};
+
+/* --- pointer (layer log lines carry the LAYER prefix) --- */
+
+static void layer_pointer_enter(void *data, struct wl_pointer *pointer, uint32_t serial,
+                                struct wl_surface *surface, wl_fixed_t sx, wl_fixed_t sy)
+{
+    (void)data;
+    (void)pointer;
+    (void)serial;
+    (void)surface;
+    log_line("LAYER PTR ENTER x=%d y=%d", wl_fixed_to_int(sx), wl_fixed_to_int(sy));
+}
+
+static void layer_pointer_leave(void *data, struct wl_pointer *pointer, uint32_t serial,
+                                struct wl_surface *surface)
+{
+    (void)data;
+    (void)pointer;
+    (void)serial;
+    (void)surface;
+    log_line("LAYER PTR LEAVE");
+}
+
+static void layer_pointer_motion(void *data, struct wl_pointer *pointer, uint32_t time,
+                                 wl_fixed_t sx, wl_fixed_t sy)
+{
+    (void)data;
+    (void)pointer;
+    (void)time;
+    (void)sx;
+    (void)sy;
+    /* Motion is not logged: the harness asserts enter/button/key only,
+     * and a motion line per event would flood the log. */
+}
+
+static void layer_pointer_button(void *data, struct wl_pointer *pointer, uint32_t serial,
+                                 uint32_t time, uint32_t button, uint32_t state)
+{
+    (void)data;
+    (void)pointer;
+    (void)serial;
+    (void)time;
+    log_line("LAYER PTR BUTTON button=%u state=%s", button,
+             state == WL_POINTER_BUTTON_STATE_PRESSED ? "pressed" : "released");
+}
+
+static void layer_pointer_axis(void *data, struct wl_pointer *pointer, uint32_t time,
+                               uint32_t axis, wl_fixed_t value)
+{
+    (void)data;
+    (void)pointer;
+    (void)time;
+    (void)axis;
+    (void)value;
+}
+
+static void layer_pointer_frame(void *data, struct wl_pointer *pointer)
+{
+    (void)data;
+    (void)pointer;
+}
+
+static const struct wl_pointer_listener layer_pointer_listener = {
+    .enter = layer_pointer_enter,
+    .leave = layer_pointer_leave,
+    .motion = layer_pointer_motion,
+    .button = layer_pointer_button,
+    .axis = layer_pointer_axis,
+    .frame = layer_pointer_frame,
+};
+
+/* --- keyboard --- */
+
+static void layer_keyboard_keymap(void *data, struct wl_keyboard *keyboard, uint32_t format,
+                                  int32_t fd, uint32_t size)
+{
+    (void)data;
+    (void)keyboard;
+    (void)format;
+    (void)size;
+    close(fd);
+}
+
+static void layer_keyboard_enter(void *data, struct wl_keyboard *keyboard, uint32_t serial,
+                                 struct wl_surface *surface, struct wl_array *keys)
+{
+    (void)data;
+    (void)keyboard;
+    (void)serial;
+    (void)surface;
+    (void)keys;
+    log_line("LAYER KEY FOCUS");
+}
+
+static void layer_keyboard_leave(void *data, struct wl_keyboard *keyboard, uint32_t serial,
+                                 struct wl_surface *surface)
+{
+    (void)data;
+    (void)keyboard;
+    (void)serial;
+    (void)surface;
+    log_line("LAYER KEY LEAVE");
+}
+
+static void layer_keyboard_key(void *data, struct wl_keyboard *keyboard, uint32_t serial,
+                               uint32_t time, uint32_t key, uint32_t state)
+{
+    (void)data;
+    (void)keyboard;
+    (void)serial;
+    (void)time;
+    log_line("LAYER KEY key=%u state=%s", key,
+             state == WL_KEYBOARD_KEY_STATE_PRESSED ? "pressed" : "released");
+}
+
+static void layer_keyboard_modifiers(void *data, struct wl_keyboard *keyboard, uint32_t serial,
+                                     uint32_t mods_depressed, uint32_t mods_latched,
+                                     uint32_t mods_locked, uint32_t group)
+{
+    (void)data;
+    (void)keyboard;
+    (void)serial;
+    (void)mods_depressed;
+    (void)mods_latched;
+    (void)mods_locked;
+    (void)group;
+}
+
+static void layer_keyboard_repeat_info(void *data, struct wl_keyboard *keyboard,
+                                       int32_t rate, int32_t delay)
+{
+    (void)data;
+    (void)keyboard;
+    (void)rate;
+    (void)delay;
+    /* Must exist: the client binds wl_seat version 5 (see
+     * keyboard_repeat_info in the M1 client). */
+}
+
+static const struct wl_keyboard_listener layer_keyboard_listener = {
+    .keymap = layer_keyboard_keymap,
+    .enter = layer_keyboard_enter,
+    .leave = layer_keyboard_leave,
+    .key = layer_keyboard_key,
+    .modifiers = layer_keyboard_modifiers,
+    .repeat_info = layer_keyboard_repeat_info,
+};
+
+static void layer_seat_capabilities(void *data, struct wl_seat *seat, uint32_t caps)
+{
+    struct layer_app *app = data;
+    if ((caps & WL_SEAT_CAPABILITY_POINTER) && !app->pointer) {
+        app->pointer = wl_seat_get_pointer(seat);
+        wl_pointer_add_listener(app->pointer, &layer_pointer_listener, app);
+    }
+    if ((caps & WL_SEAT_CAPABILITY_KEYBOARD) && !app->keyboard) {
+        app->keyboard = wl_seat_get_keyboard(seat);
+        wl_keyboard_add_listener(app->keyboard, &layer_keyboard_listener, app);
+    }
+}
+
+static void layer_seat_name(void *data, struct wl_seat *seat, const char *name)
+{
+    (void)data;
+    (void)seat;
+    (void)name;
+}
+
+static const struct wl_seat_listener layer_seat_listener = {
+    .capabilities = layer_seat_capabilities,
+    .name = layer_seat_name,
+};
+
+/* --- registry --- */
+
+static void layer_registry_global(void *data, struct wl_registry *registry, uint32_t name,
+                                  const char *interface, uint32_t version)
+{
+    struct layer_app *app = data;
+    if (strcmp(interface, wl_compositor_interface.name) == 0) {
+        app->compositor = wl_registry_bind(registry, name, &wl_compositor_interface, 4);
+    } else if (strcmp(interface, wl_shm_interface.name) == 0) {
+        app->shm = wl_registry_bind(registry, name, &wl_shm_interface, 1);
+    } else if (strcmp(interface, wl_seat_interface.name) == 0) {
+        app->seat = wl_registry_bind(registry, name, &wl_seat_interface, 5);
+        wl_seat_add_listener(app->seat, &layer_seat_listener, app);
+    } else if (strcmp(interface, zwlr_layer_shell_v1_interface.name) == 0) {
+        /* Genesis advertises v4; bind at most v4. */
+        uint32_t bind_version = version < 4 ? version : 4;
+        app->layer_shell = wl_registry_bind(registry, name,
+                                            &zwlr_layer_shell_v1_interface, bind_version);
+    }
+    (void)version;
+}
+
+static void layer_registry_global_remove(void *data, struct wl_registry *registry,
+                                         uint32_t name)
+{
+    (void)data;
+    (void)registry;
+    (void)name;
+}
+
+static const struct wl_registry_listener layer_registry_listener = {
+    .global = layer_registry_global,
+    .global_remove = layer_registry_global_remove,
+};
+
+static int run_layer_mode(void)
+{
+    start_ms = now_ms();
+    console_fd = open("/dev/console", O_WRONLY | O_NONBLOCK);
+    const char *log_path = getenv("SEVYN_LAYER_LOG");
+    log_fd = open(log_path && *log_path ? log_path : "/tmp/sevyn-layer-client.log",
+                  O_WRONLY | O_CREAT | O_TRUNC, 0644);
+
+    struct layer_app app;
+    memset(&app, 0, sizeof(app));
+    app.display = wl_display_connect(NULL);
+    if (!app.display) {
+        log_line("LAYER error: cannot connect to Wayland display (WAYLAND_DISPLAY=%s)",
+                 getenv("WAYLAND_DISPLAY") ? getenv("WAYLAND_DISPLAY") : "(unset)");
+        return 1;
+    }
+    app.registry = wl_display_get_registry(app.display);
+    wl_registry_add_listener(app.registry, &layer_registry_listener, &app);
+    if (wl_display_roundtrip(app.display) < 0) {
+        log_line("LAYER error: registry roundtrip failed");
+        return 1;
+    }
+    if (!app.compositor || !app.shm || !app.layer_shell || !app.seat) {
+        log_line("LAYER error: missing globals (compositor=%d shm=%d layer_shell=%d seat=%d)",
+                 !!app.compositor, !!app.shm, !!app.layer_shell, !!app.seat);
+        return 1;
+    }
+    /* Flush the binds queued by the registry handler (see
+     * run_manager_mode for why the roundtrip alone is not enough). */
+    wl_display_flush(app.display);
+
+    const char *namespace = getenv("SEVYN_LAYER_NAMESPACE");
+    if (!namespace || !*namespace)
+        namespace = "sevyn-test-layer";
+    int width = layer_getenv_int("SEVYN_LAYER_WIDTH", 1280);
+    int height = layer_getenv_int("SEVYN_LAYER_HEIGHT", 800);
+
+    app.surface = wl_compositor_create_surface(app.compositor);
+    app.layer_surface = zwlr_layer_shell_v1_get_layer_surface(
+        app.layer_shell, app.surface, NULL, ZWLR_LAYER_SHELL_V1_LAYER_BACKGROUND,
+        namespace);
+    zwlr_layer_surface_v1_add_listener(app.layer_surface, &layer_surface_listener, &app);
+    zwlr_layer_surface_v1_set_size(app.layer_surface, (uint32_t)width, (uint32_t)height);
+    zwlr_layer_surface_v1_set_anchor(app.layer_surface,
+                                     ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP |
+                                         ZWLR_LAYER_SURFACE_V1_ANCHOR_BOTTOM |
+                                         ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT |
+                                         ZWLR_LAYER_SURFACE_V1_ANCHOR_RIGHT);
+    zwlr_layer_surface_v1_set_exclusive_zone(app.layer_surface, -1);
+    /* Exclusive: the layer takes keyboard focus on click (the proof
+     * that a layer can hold focus), like the Shell's dock will. */
+    zwlr_layer_surface_v1_set_keyboard_interactivity(
+        app.layer_surface, ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_EXCLUSIVE);
+    wl_surface_commit(app.surface);
+
+    /* Wait for the first configure (bounded: a compositor that never
+     * configures the layer is a failure, not a hang). */
+    layer_dispatch_for_ms(app.display, 10000);
+    if (!app.configured) {
+        log_line("LAYER error: no configure in 10s");
+        return 1;
+    }
+    log_line("LAYER started namespace=%s", namespace);
+
+    while (!app.closed && wl_display_dispatch(app.display) != -1) {
+    }
+    if (app.closed) {
+        log_line("LAYER DONE");
+        return 0;
+    }
+    log_line("LAYER display dispatch ended (%s)", strerror(errno));
+    return 0;
+}
+
+#endif /* HAVE_WLR_LAYER_SHELL */
+
 int main(int argc, char **argv)
 {
     if (argc > 1 && strcmp(argv[1], "--manager") == 0) {
@@ -1543,6 +2008,16 @@ int main(int argc, char **argv)
         fprintf(stderr,
                 "test-client: --manager needs HAVE_WLR_FOREIGN_TOPLEVEL "
                 "(build with the wlr protocol sources)\n");
+        return 1;
+#endif
+    }
+    if (argc > 1 && strcmp(argv[1], "--layer") == 0) {
+#ifdef HAVE_WLR_LAYER_SHELL
+        return run_layer_mode();
+#else
+        fprintf(stderr,
+                "test-client: --layer needs HAVE_WLR_LAYER_SHELL "
+                "(build with the wlr layer-shell protocol sources)\n");
         return 1;
 #endif
     }

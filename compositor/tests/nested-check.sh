@@ -20,7 +20,13 @@
 #      the client exit and the session is recorded stopped
 #      (SESSION STOPPED reason=closed);
 #   7. the compositor exits cleanly on SIGTERM (SHUTDOWN clean) with no
-#      application processes left behind.
+#      application processes left behind;
+#   8. (window-raise fix) a fullscreen Background layer surface receives
+#      pointer/keyboard input on layer-only regions (LAYER PTR ENTER /
+#      BUTTON / KEY, compositor POINTER FOCUS / FOCUS KEYBOARD
+#      surface=layer=...), takes keyboard focus on click without raising
+#      anything, and never covers the toplevel above it (moving back
+#      re-enters the toplevel).
 #
 # What this check proves: function, not fps. The GF65 is the fps proof
 # (COMPOSITOR_PLAN.md, "60 fps bar, GF65 is the proof"); QEMU and this
@@ -64,6 +70,8 @@ XVFB_LOG="$WORK/xvfb.log"
 CLIENT_LOG="$WORK/client.log"
 # The test client hard-codes its log path (see test-client.c).
 CLIENT_HARDCODED_LOG="/tmp/sevyn-m1-client.log"
+# The --layer client hard-codes its own log path (see test-client.c).
+LAYER_HARDCODED_LOG="/tmp/sevyn-layer-client.log"
 
 fail() {
     echo "nested-check: FAIL: $*" >&2
@@ -75,13 +83,15 @@ fail() {
     tail -20 "$WESTON_LOG" >&2 || true
     echo "nested-check: --- client log ---" >&2
     cat "$CLIENT_HARDCODED_LOG" >&2 || true
+    echo "nested-check: --- layer client log ---" >&2
+    cat "$LAYER_HARDCODED_LOG" >&2 || true
     exit 1
 }
 
 cleanup() {
     # Kill by pid file where we have one; pkill patterns are kept exact
     # so the cleanup never matches this script's own command line.
-    for pid_file in "$WORK"/xvfb.pid "$WORK"/weston.pid "$WORK"/compositor.pid "$WORK"/client.pid; do
+    for pid_file in "$WORK"/xvfb.pid "$WORK"/weston.pid "$WORK"/compositor.pid "$WORK"/client.pid "$WORK"/layer-client.pid; do
         if [ -f "$pid_file" ]; then
             kill "$(cat "$pid_file")" 2>/dev/null || true
         fi
@@ -153,6 +163,27 @@ gcc -o "$WORK/sevyn-test-client" "$CLIENT_SRC" "$WORK/xdg-shell-protocol.c" "$WO
     -I"$WORK" $(pkg-config --cflags --libs wayland-client) \
     || fail "test client build failed"
 
+# --- Build the layer client (window-raise fix) ------------------------------
+# wlr-layer-shell-unstable-v1.xml ships in the wayland-protocols-wlr
+# crate (the system wayland-protocols package does not carry wlr
+# protocols); fall back to /usr/share if a future install does.
+# A second binary keeps the plain build untouched: the layer mode is
+# compiled in only with -DHAVE_WLR_LAYER_SHELL.
+LAYER_SHELL_XML="/usr/share/wayland-protocols/unstable/wlr-layer-shell-unstable-v1.xml"
+if [ ! -f "$LAYER_SHELL_XML" ]; then
+    LAYER_SHELL_XML="$(ls ~/.cargo/registry/src/*/wayland-protocols-wlr-*/wlr-protocols/unstable/wlr-layer-shell-unstable-v1.xml 2>/dev/null | head -1)"
+fi
+[ -n "$LAYER_SHELL_XML" ] && [ -f "$LAYER_SHELL_XML" ] || fail "wlr-layer-shell-unstable-v1.xml not found"
+wayland-scanner client-header "$LAYER_SHELL_XML" "$WORK/wlr-layer-shell-unstable-v1-client-protocol.h" \
+    || fail "wayland-scanner layer-shell client-header failed"
+wayland-scanner private-code "$LAYER_SHELL_XML" "$WORK/wlr-layer-shell-unstable-v1-protocol.c" \
+    || fail "wayland-scanner layer-shell private-code failed"
+gcc -DHAVE_WLR_LAYER_SHELL -o "$WORK/sevyn-test-client-layer" "$CLIENT_SRC" \
+    "$WORK/xdg-shell-protocol.c" "$WORK/presentation-time-protocol.c" \
+    "$WORK/wlr-layer-shell-unstable-v1-protocol.c" \
+    -I"$WORK" $(pkg-config --cflags --libs wayland-client) \
+    || fail "layer test client build failed"
+
 # --- Parent stack: Xvfb -> Weston (headless, x11 backend) -----------------
 export DISPLAY=":$DISPLAY_NUMBER"
 export XDG_RUNTIME_DIR="$RUNTIME_DIR"
@@ -194,6 +225,17 @@ assert_marker "SEVYN FOCUS KEYBOARD surface=1"
 grep -q "PRESENTATION presented" "$CLIENT_HARDCODED_LOG" \
     || fail "client never got presentation-time feedback (PRESENTATION presented)"
 
+# --- The layer client (window-raise fix) ------------------------------------
+# A fullscreen Background layer surface behind the toplevel: the
+# compositor must map it (LAYER SURFACE marker) without moving keyboard
+# focus off the toplevel.
+rm -f "$LAYER_HARDCODED_LOG"
+WAYLAND_DISPLAY=sevyn-nested-test "$WORK/sevyn-test-client-layer" --layer >"$WORK/layer-client.log" 2>&1 &
+echo $! >"$WORK/layer-client.pid"
+wait_for "$LAYER_HARDCODED_LOG" "LAYER CONFIGURE width=1280 height=800" "layer client configured fullscreen"
+assert_marker "SEVYN LAYER SURFACE namespace=sevyn-test-layer layer=Background mapped=true"
+assert_marker "SEVYN FOCUS KEYBOARD surface=1"
+
 # --- Input: pointer sweep, click, key --------------------------------------
 # Sweep the pointer across the output; the client must report entering one
 # of its two subsurfaces (A left, B right) with surface-local coordinates.
@@ -234,6 +276,63 @@ grep -q "KEY FOCUS window" "$CLIENT_HARDCODED_LOG" \
     || fail "client never got keyboard focus on its toplevel"
 assert_marker "SEVYN POINTER BUTTON button=272 state=pressed surface=1"
 assert_marker "SEVYN KEY .* focus=1"
+
+# --- Layer-shell input routing (window-raise fix) ---------------------------
+# Move the pointer to a region covered only by the layer surface (outside
+# the M1 window): the layer client must report the enter, the M1 client
+# must report a leave, and the compositor must report layer pointer focus.
+# The first sweep already moved over layer-only regions, so count layer
+# enters from here, not from zero.
+layer_enters_before="$(grep -c "LAYER PTR ENTER" "$LAYER_HARDCODED_LOG" || true)"
+layer_hit=""
+deadline=$((SECONDS + TIMEOUT))
+while [ "$SECONDS" -lt "$deadline" ] && [ -z "$layer_hit" ]; do
+    for x in 100 300 500 700 900 1100; do
+        for y in 100 300 500 700; do
+            xdotool mousemove "$x" "$y"
+            sleep 0.1
+            if [ "$(grep -c "LAYER PTR ENTER" "$LAYER_HARDCODED_LOG" || true)" -gt "$layer_enters_before" ]; then
+                layer_hit="$x,$y"
+                break 2
+            fi
+        done
+    done
+done
+[ -n "$layer_hit" ] || fail "pointer sweep never entered the layer surface"
+echo "nested-check: pointer entered the layer surface at output $layer_hit"
+grep -q "PTR LEAVE" "$CLIENT_HARDCODED_LOG" \
+    || fail "M1 client never saw a pointer leave when moving to the layer"
+assert_marker "SEVYN POINTER FOCUS surface=layer=sevyn-test-layer"
+
+# Click on the layer-only region, then press a key: both must reach the
+# layer surface, and keyboard focus must move to it (a layer never
+# raises — there is nothing above it to raise, and the M1 window must
+# stay on top: moving back over it re-enters it below).
+xdotool mousemove "${layer_hit%,*}" "${layer_hit#*,}"
+sleep 0.3
+xdotool click 1
+sleep 0.3
+xdotool key a
+sleep 0.5
+grep -q "LAYER PTR BUTTON button=272 state=pressed" "$LAYER_HARDCODED_LOG" \
+    || fail "layer client never saw the pointer button press"
+grep -q "LAYER KEY FOCUS" "$LAYER_HARDCODED_LOG" \
+    || fail "layer client never got keyboard focus"
+grep -q "LAYER KEY key=30 state=pressed" "$LAYER_HARDCODED_LOG" \
+    || fail "layer client never saw the key press (key=30 is 'a' as sent by Weston)"
+assert_marker "SEVYN POINTER BUTTON button=272 state=pressed surface=layer=sevyn-test-layer"
+assert_marker "SEVYN FOCUS KEYBOARD surface=layer=sevyn-test-layer"
+
+# Move back over the M1 window: it must re-enter (the layer never
+# covered it) and the layer must report the leave.
+m1_enters_before="$(grep -c "PTR ENTER" "$CLIENT_HARDCODED_LOG" || true)"
+xdotool mousemove "${sweep_hit%,*}" "${sweep_hit#*,}"
+sleep 0.5
+[ "$(grep -c "PTR ENTER" "$CLIENT_HARDCODED_LOG" || true)" -gt "$m1_enters_before" ] \
+    || fail "M1 client never re-entered after moving back from the layer"
+grep -q "LAYER PTR LEAVE" "$LAYER_HARDCODED_LOG" \
+    || fail "layer client never saw a pointer leave when moving back to the window"
+assert_marker "SEVYN POINTER FOCUS surface=1"
 
 # --- Close from the Shell side, via the bridge ------------------------------
 SESSION="$(grep -o "SESSION ASSOCIATED session=[^ ]*" "$COMPOSITOR_LOG" | head -1 | cut -d= -f2)"
@@ -280,6 +379,7 @@ fi
 
 echo "nested-check: PASS — all Stage 2 milestones proven"
 echo "nested-check: output created, surface accepted + associated, input routed, close + clean shutdown, no orphans"
+echo "nested-check: PASS — layer-shell input routing proven (layer enter/click/key/focus, toplevel re-enter)"
 
 # --- Stage 4 adoption (adoption-check.sh, nested backend) -------------------
 # The Stage 4 harness boots its own parent stack (Xvfb :99 + Weston +
