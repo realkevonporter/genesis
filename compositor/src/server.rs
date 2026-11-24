@@ -239,6 +239,10 @@ pub struct GenesisState {
     pub pointer_location: Point<f64, Logical>,
     /// Surface id under the pointer, if any.
     pub pointer_focus_id: Option<u64>,
+    /// Namespace of the layer surface under the pointer, if any (see
+    /// `input.rs` — a layer hit has no registry record, so the id
+    /// stays `None` and the marker reports the namespace instead).
+    pub pointer_focus_layer: Option<String>,
     /// Surface id holding keyboard focus, if any.
     pub keyboard_focus_id: Option<u64>,
     /// Set when a frame needs presenting (commit, new surface, resize…).
@@ -413,6 +417,7 @@ impl GenesisState {
             serial_counter: 1,
             pointer_location: (0.0, 0.0).into(),
             pointer_focus_id: None,
+            pointer_focus_layer: None,
             keyboard_focus_id: None,
             needs_redraw: true,
             frames_presented: 0,
@@ -535,6 +540,44 @@ impl GenesisState {
         keyboard.set_focus(self, focus, serial);
         self.keyboard_focus_id = target_id;
         self.needs_redraw = true;
+    }
+
+    /// Give keyboard focus to a layer surface (or clear it). Layers
+    /// are not in the `Space` and hold no `Activated` state: every
+    /// toplevel is deactivated and keyboard focus moves straight to
+    /// the layer's leaf surface. Called on pointer press / touch down
+    /// over a layer that can receive keyboard focus (see `input.rs`),
+    /// and with `None` when a focused layer surface is destroyed.
+    ///
+    /// A layer holding focus is untouched by toplevel reconciliation:
+    /// `reconcile_surfaces` only moves focus when
+    /// `keyboard_focus_id == Some(id)` for a gone record, and a layer
+    /// focus keeps that id at `None`.
+    pub fn set_keyboard_focus_layer(&mut self, surface: Option<&WlSurface>) {
+        let serial = self.next_serial();
+        for toplevel in self.xdg_shell_state.toplevel_surfaces() {
+            toplevel.with_pending_state(|state| {
+                use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::State as ToplevelState;
+                state.states.unset(ToplevelState::Activated);
+            });
+            toplevel.send_configure();
+        }
+        let keyboard = self.keyboard.clone();
+        keyboard.set_focus(self, surface.cloned(), serial);
+        self.keyboard_focus_id = None;
+        self.needs_redraw = true;
+    }
+
+    /// Namespace of the mapped layer surface owning `surface`, if the
+    /// surface belongs to a layer (toplevel or subsurface leaf).
+    /// Used by `focus_changed` and `layer_destroyed` so the
+    /// keyboard-focus marker names a layer instead of reporting
+    /// `(none)`, and so a destroyed layer can tell whether it held
+    /// keyboard focus.
+    pub fn layer_namespace_for_surface(&self, surface: &WlSurface) -> Option<String> {
+        layer_map_for_output(&self.output)
+            .layer_for_surface(surface, WindowSurfaceType::ALL)
+            .map(|layer_surface| layer_surface.namespace().to_string())
     }
 
     /// Ask a surface to close (bridge `close`, or shutdown). The client
@@ -741,7 +784,20 @@ impl CompositorHandler for GenesisState {
         // changes its arranged geometry in the LayerMap. Re-arranging
         // on every commit is cheap (it walks the mapped layers, usually
         // none) and keeps the map correct without a separate hook.
+        // `arrange` only stages the new geometry as pending state —
+        // the client learns it from a configure, so forward any pending
+        // configure now (a no-op when nothing changed). Without this
+        // a layer client keeps the first configure it got: the initial
+        // configure is sent from `new_layer_surface`, before the
+        // client's `set_size` is even read, so with no requested size
+        // yet the arrange falls back to half the output — and the
+        // client would render at that fallback size forever, never
+        // learning its real size. (The Shell would hit exactly this
+        // when it asks for fullscreen.)
         layer_map_for_output(&self.output).arrange();
+        for layer in self.layer_shell_state.layer_surfaces() {
+            layer.send_pending_configure();
+        }
         self.needs_redraw = true;
     }
 }
@@ -764,15 +820,18 @@ impl SeatHandler for GenesisState {
     }
 
     fn focus_changed(&mut self, _seat: &Seat<Self>, focused: Option<&WlSurface>) {
-        let id = focused.and_then(|surface| {
+        let label = focused.and_then(|surface| {
             self.registry
                 .by_object_id(&surface.id())
-                .map(|record| record.id)
+                .map(|record| record.id.to_string())
+                .or_else(|| {
+                    self.layer_namespace_for_surface(surface)
+                        .map(|namespace| format!("layer={namespace}"))
+                })
         });
         marker!(
             "FOCUS KEYBOARD surface={}",
-            id.map(|id| id.to_string())
-                .unwrap_or_else(|| "(none)".to_string())
+            label.unwrap_or_else(|| "(none)".to_string())
         );
     }
 
@@ -828,16 +887,12 @@ impl WlrLayerShellHandler for GenesisState {
     /// `render_elements_for_output` already renders mapped layers
     /// (background/bottom below windows, top/overlay above), so
     /// mapping is the whole render story — and given an initial
-    /// configure so the client knows how to size itself. The Shell
-    /// migrating its chrome onto layer surfaces is a follow-up (the
-    /// Shell works today with chrome drawn inside its own surface);
-    /// what lands here is the protocol + mapping + rendering.
-    ///
-    /// Known limitation, named not hidden: pointer/keyboard input is
-    /// not yet routed to layer surfaces — `input.rs` hit-tests the
-    /// `Space` (toplevels) only, so a click on a layer surface falls
-    /// through to the toplevel beneath it. Routing input to layers
-    /// lands with the Shell migration.
+    /// configure so the client knows how to size itself. Pointer and
+    /// keyboard input are routed to layers by `input.rs` (z-ordered
+    /// hit-test; a layer never raises, and takes keyboard focus only
+    /// when it can receive it). The remaining step is the client
+    /// side: the Shell migrating its chrome onto layer surfaces (a
+    /// sevynos change, not a Genesis one).
     fn new_layer_surface(
         &mut self,
         surface: WlrLayerSurface,
@@ -862,6 +917,19 @@ impl WlrLayerShellHandler for GenesisState {
             .layer_for_surface(&wl_surface, WindowSurfaceType::TOPLEVEL)
             .cloned();
         if let Some(layer_surface) = existing {
+            // A destroyed layer that held keyboard focus must release
+            // it, or keys would keep going to a dead surface. The
+            // focus may sit on a subsurface leaf of the layer, so the
+            // check resolves the focused surface through the layer
+            // map (not by object id) — and runs before the unmap.
+            let had_focus = self
+                .keyboard
+                .current_focus()
+                .and_then(|focused| self.layer_namespace_for_surface(&focused))
+                .is_some_and(|namespace| namespace == layer_surface.namespace());
+            if had_focus {
+                self.set_keyboard_focus_layer(None);
+            }
             let namespace = layer_surface.namespace().to_string();
             layer_map_for_output(&self.output).unmap_layer(&layer_surface);
             marker!("LAYER SURFACE DESTROYED namespace={namespace}");
