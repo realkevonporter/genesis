@@ -69,9 +69,12 @@ smithay::backend::renderer::element::render_elements! {
 /// The clipped render elements for every live adoption, one entry per
 /// Browser window: the Browser window (for stacking — see
 /// [`splice_adopted`]) and the adopted Chromium surface's elements,
-/// placed at the Browser window's output position plus the rect origin
-/// and cropped to the rect (global compositor coordinates, scaled to
-/// physical pixels by `scale`).
+/// placed so the Chromium window's GEOMETRY lands at the Browser
+/// window's output position plus the rect origin (see
+/// [`GenesisState::adopted_buffer_origin`]: the surface tree is
+/// positioned by its buffer origin, so the geometry offset is
+/// subtracted first) and cropped to the rect (global compositor
+/// coordinates, scaled to physical pixels by `scale`).
 ///
 /// An adoption whose Browser window is not mapped, or whose Chromium
 /// surface has not committed a buffer yet, contributes an empty
@@ -104,7 +107,12 @@ where
         else {
             continue;
         };
-        let Some(location) = state.adopted_location(&adoption) else {
+        // The surface tree is positioned by its BUFFER origin; the
+        // adoption rect names the GEOMETRY origin — subtract the
+        // geometry offset so the window itself (not its shadow
+        // margins) lands at the rect origin. See
+        // `GenesisState::adopted_buffer_origin`.
+        let Some(location) = state.adopted_buffer_origin(&adoption) else {
             out.push((browser, Vec::new()));
             continue;
         };
@@ -252,7 +260,10 @@ where
     }
     // Popups of adopted Chromium windows: the adopted window is not
     // in the Space (see `adoption.rs`), so its popups are collected
-    // here at the adopted location instead.
+    // here at the adopted location instead. The parent location is
+    // the BUFFER origin (popup positions are relative to the parent
+    // surface), so the same geometry-offset subtraction applies as
+    // for the window itself — see `adopted_buffer_origin`.
     for adoption in state.adoptions.clone() {
         let Some(chromium) = state
             .registry
@@ -261,7 +272,7 @@ where
         else {
             continue;
         };
-        let Some(location) = state.adopted_location(&adoption) else {
+        let Some(location) = state.adopted_buffer_origin(&adoption) else {
             continue;
         };
         collect_popups(renderer, &chromium, location, scale, &mut elements);
