@@ -123,6 +123,24 @@ association itself is also written to stdout as `SESSION ASSOCIATED` /
 `SESSION STOPPED` markers — the record the (future) Runtime consumes
 to record the stopped state (ADR-0006 milestones 6 and 10).
 
+Screen capture extends the same socket with the `capture` op (see
+`src/capture.rs`): `{"v": 1, "op": "capture"}` renders the scene once
+into an offscreen target (Smithay's `Offscreen` + `ExportMem`
+readback — Smithay 0.7.0 has no screencopy module) and writes
+`/data/screen/latest.png`, overwritten on every capture — exactly one
+frame, no history. The reply is deferred one loop iteration and
+carries the frame size and path:
+`{"ok": true, "op": "capture", "width": 1280, "height": 800, "path": "..."}`.
+An optional absolute `"path"` overrides the output (for tests — the
+CI user cannot write `/data`). When a sensitive surface is visible
+(lock screen / password prompt, matched on layer namespaces and
+toplevel app ids + titles — see `capture.rs` for the exact rule) the
+op refuses outright (`"refused: sensitive surface"`) and writes
+nothing. The socket's existing 0600 same-uid gating is the
+permission story: no new auth, no public Wayland protocol surface.
+The relay agent reads the PNG file directly and streams it over the
+relay channel; no frame travels through the daemon.
+
 ### The nested check
 
 ```sh
@@ -138,6 +156,28 @@ shutdown with no orphaned processes. The check proves function, not
 fps — the GF65 is the fps proof (see the plan's 60 fps bar). The same
 script runs in CI.
 
+### The capture check
+
+```sh
+compositor/tests/capture-check.sh
+```
+
+Boots the same nested stack and proves the bridge `capture` op:
+a valid PNG carrying the compositor's actual pixels (the test
+client's known solid colours at known positions), a second capture
+overwriting the same single file (identical bytes for an unchanged
+scene, different bytes once the scene changes — no history),
+refusal with `"refused: sensitive surface"` for a sensitive layer
+stand-in (`sevyn-lock`) and a sensitive toplevel stand-in
+(`sevyn.lock` / "Lock Screen") with the last good frame untouched,
+and malformed requests leaving the compositor alive. The PNG is
+decoded with a stdlib-only Python decoder and asserted on IHDR
+dimensions and pixel values, not file existence. The DRM path's
+pixels are not proven here (no DRM device in CI) — they are proven
+downstream by the QMP screendump oracle in the SevynOS m13 check —
+and the default output path `/data/screen/latest.png` is proven
+on-device at the GF65 gate. The same script runs in CI.
+
 ### Not yet (named, not claimed)
 
 - **No Shell, no Runtime.** The Shell (RN host) and the Runtime do not
@@ -152,10 +192,12 @@ script runs in CI.
   the nested check; the dmabuf global exists in standalone mode and
   imports into the active renderer, but the zero-copy path and 60 fps
   are proven on the GF65 (Stages 4–5).
-- **Rendered-frame orientation is not pixel-verified headless.** Frames
-  are proven to flow (frame callbacks + client READY); the flip
-  (`Transform::Flipped180`, per Smithay's `minimal` example) is a
-  visual proof item for the GF65.
+- **Rendered-frame orientation is pixel-verified headless (nested).**
+  The capture check decodes the captured PNG and asserts known
+  client colours at known positions, which pins the offscreen
+  render's orientation. The presented frame's flip
+  (`Transform::Flipped180`, per Smithay's `minimal` example) is
+  still a visual proof item for the GF65.
 
 ## Stage 3 — standalone backend (DRM/KMS)
 

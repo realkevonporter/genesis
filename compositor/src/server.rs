@@ -292,6 +292,17 @@ pub struct GenesisState {
     /// the last scene but refuses new adoptions (see
     /// `GenesisState::adopt`).
     pub runtime_degraded: bool,
+
+    /// A pending screen capture, recorded by the bridge `capture` op
+    /// and resolved by the backend after the next render (see
+    /// `capture.rs`). At most one is ever pending; a second request
+    /// while one is pending is refused outright.
+    pub capture_request: Option<crate::capture::CaptureRequest>,
+    /// The serialised JSON reply for a resolved capture, drained
+    /// into the bridge connections by `BridgeServer::poll`. Set by
+    /// the backend that ran the capture; the bridge handler never
+    /// sets it (it only records the request).
+    pub capture_reply: Option<String>,
 }
 
 impl GenesisState {
@@ -432,6 +443,8 @@ impl GenesisState {
             adoptions: Vec::new(),
             pending_bridge_events: Vec::new(),
             runtime_degraded: false,
+            capture_request: None,
+            capture_reply: None,
         }
     }
 

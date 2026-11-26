@@ -26,7 +26,21 @@
 //!   The op set is additive within the version, and the socket path and
 //!   auth story (`SO_PEERCRED`, same-uid peer, mode 0600) are the plan's;
 //!   Stage 4 adds pid-binding to the known Runtime pid (see
-//!   `--runtime-pid` and `BridgeServer::bind`).
+//!   `--runtime-pid` and `BridgeServer::bind`). Screen capture adds the
+//!   `capture` op (see `capture.rs` for the readback and the S3 rule):
+//!   `{"v": 1, "op": "capture"}` renders the scene once into an
+//!   offscreen target and writes `/data/screen/latest.png` (overwritten
+//!   on every capture — S4 keeps exactly one frame), replying
+//!   `{"ok": true, "op": "capture", "width": <w>, "height": <h>,
+//!   "path": "<path>"}`. An optional absolute `"path"` overrides the
+//!   output (for tests — the CI user cannot write `/data`); a
+//!   relative or empty path is `"malformed request"`. The reply is
+//!   deferred one loop iteration: the handler only records the
+//!   request, and the backend resolves it after the next render, so
+//!   the reply arrives on the same connection shortly after the
+//!   request. When a sensitive surface is visible the op refuses
+//!   outright (`{"ok": false, "error": "refused: sensitive surface"}`)
+//!   and writes nothing, leaving the last good frame untouched.
 //!
 //! What does NOT exist yet (documented next steps, not silent gaps):
 //!
@@ -178,6 +192,9 @@ struct BridgeRequest {
     chromium_pid: Option<u32>,
     /// The content rect, for `adopt` / `move` / `resize` only.
     rect: Option<RectJson>,
+    /// The output path, for `capture` only (absolute; the default is
+    /// [`crate::capture::DEFAULT_CAPTURE_PATH`]).
+    path: Option<String>,
 }
 
 /// One bridge response (one JSON object per line).
@@ -190,6 +207,15 @@ struct BridgeResponse {
     session: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+    /// The captured frame width, for `capture` success only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    width: Option<u32>,
+    /// The captured frame height, for `capture` success only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    height: Option<u32>,
+    /// The PNG that was written, for `capture` success only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    path: Option<String>,
 }
 
 impl BridgeResponse {
@@ -200,6 +226,9 @@ impl BridgeResponse {
             op: op.to_string(),
             session,
             error: None,
+            width: None,
+            height: None,
+            path: None,
         }
     }
 
@@ -210,8 +239,39 @@ impl BridgeResponse {
             op: op.to_string(),
             session: None,
             error: Some(error.to_string()),
+            width: None,
+            height: None,
+            path: None,
         }
     }
+
+    fn capture_ok(width: u32, height: u32, path: &str) -> Self {
+        Self {
+            v: BRIDGE_PROTOCOL_VERSION,
+            ok: true,
+            op: "capture".to_string(),
+            session: None,
+            error: None,
+            width: Some(width),
+            height: Some(height),
+            path: Some(path.to_string()),
+        }
+    }
+}
+
+/// Serialise a capture success reply. The backends build the reply
+/// for a capture they resolved (see `capture.rs`); the JSON goes to
+/// `GenesisState::capture_reply` and `BridgeServer::poll` drains it.
+pub(crate) fn capture_ok_json(width: u32, height: u32, path: &str) -> String {
+    serde_json::to_string(&BridgeResponse::capture_ok(width, height, path))
+        .unwrap_or_else(|_| "{\"v\":1,\"ok\":true,\"op\":\"capture\"}".to_string())
+}
+
+/// Serialise a capture failure reply (readback / write error, or a
+/// sensitive surface found at capture time).
+pub(crate) fn capture_err_json(error: &str) -> String {
+    serde_json::to_string(&BridgeResponse::err("capture", error))
+        .unwrap_or_else(|_| "{\"v\":1,\"ok\":false,\"op\":\"capture\"}".to_string())
 }
 
 /// One connected bridge client, with its buffered input and output.
@@ -348,6 +408,22 @@ impl BridgeServer {
             state.pending_bridge_events.drain(..excess);
             diag!("bridge: dropped {excess} undelivered bridge event(s)");
         }
+        // A resolved capture's reply, drained the same way as the
+        // queued events: the handler records the request (see
+        // `handle_bridge_request`), the backend resolves it after the
+        // next render and stores the serialised reply in
+        // `state.capture_reply`, and the next poll delivers it. The
+        // reply goes to every connected client — in practice the one
+        // Runtime that asked.
+        if !self.connections.is_empty() {
+            if let Some(reply) = state.capture_reply.take() {
+                let mut bytes = reply.into_bytes();
+                bytes.push(b'\n');
+                for connection in &mut self.connections {
+                    connection.outgoing.extend_from_slice(&bytes);
+                }
+            }
+        }
 
         loop {
             match self.listener.accept() {
@@ -455,11 +531,15 @@ impl BridgeServer {
                         }
                     }
                 }
-                // One complete line is one request.
+                // One complete line is one request. A `capture`
+                // request has no immediate reply: the handler records
+                // it and the backend resolves it after the next
+                // render (see `handle_bridge_request`), so `None`
+                // here means "reply deferred", not "no reply".
                 if !drop_connection {
                     if let Some(newline) = connection.incoming.iter().position(|b| *b == b'\n') {
                         let line: Vec<u8> = connection.incoming.drain(..=newline).collect();
-                        response = Some(handle_bridge_request(state, &line));
+                        response = handle_bridge_request(state, &line);
                     }
                 }
             }
@@ -505,42 +585,76 @@ impl BridgeServer {
 /// compositor to close an application (ADR-0006 milestone 9); `ping` is
 /// the liveness check. Stage 4 adds `adopt` / `move` / `resize` /
 /// `release` (see `adoption.rs` for the semantics and the exact error
-/// strings). A malformed request — bad JSON, a missing required field,
-/// a non-positive rect dimension — is `"malformed request"`; the
-/// adoption failures themselves carry their own strings.
-fn handle_bridge_request(state: &mut GenesisState, line: &[u8]) -> BridgeResponse {
+/// strings). Screen capture adds `capture` (see `capture.rs`): it
+/// records the request in `state.capture_request` and returns `None`
+/// — the reply is deferred until the backend resolves the capture
+/// after the next render. Every other op returns its reply
+/// immediately (`Some`). A malformed request — bad JSON, a missing
+/// required field, a non-positive rect dimension — is `"malformed
+/// request"`; the adoption failures themselves carry their own
+/// strings. A sensitive surface visible at request time refuses the
+/// capture at once (`"refused: sensitive surface"`); the backend
+/// re-checks at capture time, so a surface that appears between the
+/// request and the render is still caught.
+fn handle_bridge_request(state: &mut GenesisState, line: &[u8]) -> Option<BridgeResponse> {
     let request: BridgeRequest = match serde_json::from_slice(line) {
         Ok(request) => request,
-        Err(_) => return BridgeResponse::err("(unparsed)", "malformed request"),
+        Err(_) => return Some(BridgeResponse::err("(unparsed)", "malformed request")),
     };
     if request.v != BRIDGE_PROTOCOL_VERSION {
-        return BridgeResponse::err(&request.op, "unsupported protocol version");
+        return Some(BridgeResponse::err(
+            &request.op,
+            "unsupported protocol version",
+        ));
     }
     match request.op.as_str() {
-        "ping" => BridgeResponse::ok("ping", None),
+        "ping" => Some(BridgeResponse::ok("ping", None)),
+        "capture" => {
+            if state.capture_request.is_some() {
+                return Some(BridgeResponse::err("capture", "capture already pending"));
+            }
+            let output_path = match &request.path {
+                Some(path) if !path.is_empty() => {
+                    let path = std::path::PathBuf::from(path);
+                    if !path.is_absolute() {
+                        return Some(BridgeResponse::err("capture", "malformed request"));
+                    }
+                    path
+                }
+                Some(_) => return Some(BridgeResponse::err("capture", "malformed request")),
+                None => std::path::PathBuf::from(crate::capture::DEFAULT_CAPTURE_PATH),
+            };
+            if let Some(detail) = crate::capture::sensitive_surface_visible(state) {
+                crate::marker!("CAPTURE REFUSED reason=sensitive-surface detail={detail}");
+                return Some(BridgeResponse::err("capture", "refused: sensitive surface"));
+            }
+            state.capture_request = Some(crate::capture::CaptureRequest { output_path });
+            state.needs_redraw = true;
+            None
+        }
         "close" => {
             let Some(session) = request.session else {
-                return BridgeResponse::err("close", "malformed request");
+                return Some(BridgeResponse::err("close", "malformed request"));
             };
             let Some(record) = state
                 .registry
                 .by_session(&SessionId(session.clone()))
                 .map(|record| record.id)
             else {
-                return BridgeResponse::err("close", "unknown session");
+                return Some(BridgeResponse::err("close", "unknown session"));
             };
             state.close_surface(record);
             state.needs_redraw = true;
-            BridgeResponse::ok("close", Some(session))
+            Some(BridgeResponse::ok("close", Some(session)))
         }
         "adopt" => {
             let (Some(session), Some(chromium_pid), Some(rect)) =
                 (request.session, request.chromium_pid, request.rect)
             else {
-                return BridgeResponse::err("adopt", "malformed request");
+                return Some(BridgeResponse::err("adopt", "malformed request"));
             };
             if rect.w <= 0 || rect.h <= 0 {
-                return BridgeResponse::err("adopt", "malformed request");
+                return Some(BridgeResponse::err("adopt", "malformed request"));
             }
             match state.adopt(
                 &session,
@@ -552,16 +666,16 @@ fn handle_bridge_request(state: &mut GenesisState, line: &[u8]) -> BridgeRespons
                     h: rect.h,
                 },
             ) {
-                Ok(()) => BridgeResponse::ok("adopt", Some(session)),
-                Err(error) => BridgeResponse::err("adopt", error),
+                Ok(()) => Some(BridgeResponse::ok("adopt", Some(session))),
+                Err(error) => Some(BridgeResponse::err("adopt", error)),
             }
         }
         "move" => {
             let (Some(session), Some(rect)) = (request.session, request.rect) else {
-                return BridgeResponse::err("move", "malformed request");
+                return Some(BridgeResponse::err("move", "malformed request"));
             };
             if rect.w <= 0 || rect.h <= 0 {
-                return BridgeResponse::err("move", "malformed request");
+                return Some(BridgeResponse::err("move", "malformed request"));
             }
             match state.move_adoption(
                 &session,
@@ -572,16 +686,16 @@ fn handle_bridge_request(state: &mut GenesisState, line: &[u8]) -> BridgeRespons
                     h: rect.h,
                 },
             ) {
-                Ok(()) => BridgeResponse::ok("move", Some(session)),
-                Err(error) => BridgeResponse::err("move", error),
+                Ok(()) => Some(BridgeResponse::ok("move", Some(session))),
+                Err(error) => Some(BridgeResponse::err("move", error)),
             }
         }
         "resize" => {
             let (Some(session), Some(rect)) = (request.session, request.rect) else {
-                return BridgeResponse::err("resize", "malformed request");
+                return Some(BridgeResponse::err("resize", "malformed request"));
             };
             if rect.w <= 0 || rect.h <= 0 {
-                return BridgeResponse::err("resize", "malformed request");
+                return Some(BridgeResponse::err("resize", "malformed request"));
             }
             match state.resize_adoption(
                 &session,
@@ -592,19 +706,19 @@ fn handle_bridge_request(state: &mut GenesisState, line: &[u8]) -> BridgeRespons
                     h: rect.h,
                 },
             ) {
-                Ok(()) => BridgeResponse::ok("resize", Some(session)),
-                Err(error) => BridgeResponse::err("resize", error),
+                Ok(()) => Some(BridgeResponse::ok("resize", Some(session))),
+                Err(error) => Some(BridgeResponse::err("resize", error)),
             }
         }
         "release" => {
             let Some(session) = request.session else {
-                return BridgeResponse::err("release", "malformed request");
+                return Some(BridgeResponse::err("release", "malformed request"));
             };
             match state.release_adoption(&session) {
-                Ok(()) => BridgeResponse::ok("release", Some(session)),
-                Err(error) => BridgeResponse::err("release", error),
+                Ok(()) => Some(BridgeResponse::ok("release", Some(session))),
+                Err(error) => Some(BridgeResponse::err("release", error)),
             }
         }
-        _ => BridgeResponse::err(&request.op, "unknown op"),
+        _ => Some(BridgeResponse::err(&request.op, "unknown op")),
     }
 }

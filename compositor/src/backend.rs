@@ -51,7 +51,12 @@ use std::{
 
 use smithay::{
     backend::{
-        renderer::{gles::GlesRenderer, utils::draw_render_elements, Color32F, Frame, Renderer},
+        renderer::{
+            element::surface::WaylandSurfaceRenderElement,
+            gles::{GlesRenderer, GlesTexture},
+            utils::draw_render_elements,
+            Color32F, Frame, Renderer,
+        },
         winit::{self, WinitEvent, WinitGraphicsBackend},
     },
     output::Mode,
@@ -82,6 +87,112 @@ extern "C" fn on_signal(_signal: libc::c_int) {
     SHUTDOWN_REQUESTED.store(true, Ordering::SeqCst);
 }
 
+/// The nested scene's element lists: the space / adopted elements
+/// and the popups above them (see `collect_nested_elements`).
+type NestedSceneElements = (
+    Vec<NestedRenderElements<GlesRenderer>>,
+    Vec<WaylandSurfaceRenderElement<GlesRenderer>>,
+);
+
+/// Collect the nested scene's element list (the space's elements
+/// with each adoption's clipped Chromium elements spliced in, plus
+/// the popups above their parents), in draw order. Shared by the
+/// presented frame and the capture pass so both render the same
+/// scene: the popups are returned separately because the presented
+/// frame draws them in a second `draw_render_elements` call (on top),
+/// while the capture pass prepends them to the same list (first in
+/// the list is topmost — see `run_capture`).
+fn collect_nested_elements(
+    state: &GenesisState,
+    renderer: &mut GlesRenderer,
+) -> Result<NestedSceneElements, Box<dyn std::error::Error>> {
+    let space_elements = state
+        .space
+        .render_elements_for_output(renderer, &state.output, 1.0)?;
+    let mut elements: Vec<NestedRenderElements<GlesRenderer>> = space_elements
+        .into_iter()
+        .map(|element| match element {
+            smithay::desktop::space::SpaceRenderElements::Surface(element) => {
+                NestedRenderElements::Surface(element)
+            }
+            smithay::desktop::space::SpaceRenderElements::Element(element) => {
+                NestedRenderElements::Wrapped(element)
+            }
+            smithay::desktop::space::SpaceRenderElements::_GenericCatcher(_) => {
+                unreachable!()
+            }
+        })
+        .collect();
+    let adopted: Vec<(
+        smithay::desktop::Window,
+        Vec<NestedRenderElements<GlesRenderer>>,
+    )> = adopted_elements(state, renderer, 1.0)
+        .into_iter()
+        .map(|(window, cropped)| {
+            (
+                window,
+                cropped
+                    .into_iter()
+                    .map(NestedRenderElements::Cropped)
+                    .collect(),
+            )
+        })
+        .collect();
+    elements = splice_adopted(elements, adopted);
+    let popups = popup_elements(state, renderer, 1.0);
+    Ok((elements, popups))
+}
+
+/// Serve one pending capture on the nested backend: re-check the S3
+/// rule against the scene as it stands now, render the scene into an
+/// offscreen target, and resolve the request (PNG written, or refusal)
+/// into `state.capture_reply` for the next bridge poll. The capture
+/// renders into its own offscreen target, never into the window, and
+/// never touches the presented frame.
+fn run_capture(
+    state: &mut GenesisState,
+    backend: &mut WinitGraphicsBackend<GlesRenderer>,
+    request: crate::capture::CaptureRequest,
+) {
+    // S3 re-check at capture time: a sensitive surface that appeared
+    // after the request (but before this render) still refuses, and
+    // nothing is written.
+    if let Some(detail) = crate::capture::sensitive_surface_visible(state) {
+        marker!("CAPTURE REFUSED reason=sensitive-surface detail={detail}");
+        state.capture_reply = Some(crate::runtime_bridge::capture_err_json(
+            "refused: sensitive surface",
+        ));
+        return;
+    }
+    let size = backend.window_size();
+    let outcome = (|| -> Result<crate::capture::CapturedFrame, String> {
+        // A second bind for the capture pass: the presented frame's
+        // framebuffer is already dropped, and re-binding the EGL
+        // surface just makes the context current again. The window
+        // target stays alive (but untouched) while the capture
+        // renders into its offscreen target.
+        let (renderer, _window_target) = backend
+            .bind()
+            .map_err(|err| format!("capture failed: cannot bind window: {err:?}"))?;
+        let (mut elements, popups) = collect_nested_elements(state, renderer)
+            .map_err(|err| format!("capture failed: cannot collect scene: {err}"))?;
+        // Popups first: `draw_render_elements` draws the list in
+        // reverse, so the first element is topmost — the same order
+        // the presented frame draws (elements, then popups).
+        let mut combined: Vec<NestedRenderElements<GlesRenderer>> = popups
+            .into_iter()
+            .map(NestedRenderElements::Surface)
+            .collect();
+        combined.append(&mut elements);
+        crate::capture::capture_offscreen::<
+            GlesRenderer,
+            GlesTexture,
+            NestedRenderElements<GlesRenderer>,
+        >(renderer, &combined, size)
+    })();
+    crate::capture::resolve_capture(state, request, outcome);
+}
+
 /// Present one frame: render the scene into the winit window, send frame
 /// callbacks, and submit.
 ///
@@ -90,57 +201,40 @@ extern "C" fn on_signal(_signal: libc::c_int) {
 /// window's elements (see `render::splice_adopted`), drawn in one pass
 /// — so a Browser move and its adopted element's move are the same
 /// frame, structurally.
+///
+/// A pending capture is served after the presented frame, even when
+/// the frame itself failed: the offscreen render is independent of
+/// the window render, so a capture request always gets its reply.
 fn render(
     state: &mut GenesisState,
     backend: &mut WinitGraphicsBackend<GlesRenderer>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let size = backend.window_size();
     let damage = Rectangle::from_size(size);
+    let frame_result = render_frame(state, backend, size, damage);
+    if let Some(request) = state.capture_request.take() {
+        run_capture(state, backend, request);
+    }
+    frame_result
+}
+
+fn render_frame(
+    state: &mut GenesisState,
+    backend: &mut WinitGraphicsBackend<GlesRenderer>,
+    size: Size<i32, Physical>,
+    damage: Rectangle<i32, Physical>,
+) -> Result<(), Box<dyn std::error::Error>> {
     {
         // The framebuffer borrows the backend (its `Drop` runs the GL
         // teardown), so the whole render must finish — and the borrow
         // must end — before `submit` borrows the backend again.
         let (renderer, mut framebuffer) = backend.bind()?;
-        let space_elements =
-            state
-                .space
-                .render_elements_for_output(renderer, &state.output, 1.0)?;
-        let mut elements: Vec<NestedRenderElements<GlesRenderer>> = space_elements
-            .into_iter()
-            .map(|element| match element {
-                smithay::desktop::space::SpaceRenderElements::Surface(element) => {
-                    NestedRenderElements::Surface(element)
-                }
-                smithay::desktop::space::SpaceRenderElements::Element(element) => {
-                    NestedRenderElements::Wrapped(element)
-                }
-                smithay::desktop::space::SpaceRenderElements::_GenericCatcher(_) => {
-                    unreachable!()
-                }
-            })
-            .collect();
-        let adopted: Vec<(
-            smithay::desktop::Window,
-            Vec<NestedRenderElements<GlesRenderer>>,
-        )> = adopted_elements(state, renderer, 1.0)
-            .into_iter()
-            .map(|(window, cropped)| {
-                (
-                    window,
-                    cropped
-                        .into_iter()
-                        .map(NestedRenderElements::Cropped)
-                        .collect(),
-                )
-            })
-            .collect();
-        elements = splice_adopted(elements, adopted);
-        let popup_elements = popup_elements(state, renderer, 1.0);
+        let (elements, popups) = collect_nested_elements(state, renderer)?;
 
         let mut frame = renderer.render(&mut framebuffer, size, Transform::Flipped180)?;
         frame.clear(Color32F::new(0.05, 0.05, 0.08, 1.0), &[damage])?;
         draw_render_elements(&mut frame, 1.0, &elements, &[damage])?;
-        draw_render_elements(&mut frame, 1.0, &popup_elements, &[damage])?;
+        draw_render_elements(&mut frame, 1.0, &popups, &[damage])?;
         let _ = frame.finish()?;
     }
 
