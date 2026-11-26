@@ -199,6 +199,24 @@ impl GenesisState {
             .cloned()
     }
 
+    /// The adoption whose Browser window is `window`, if any — the
+    /// mirror of `adoption_for_chromium_window`, for hit-testing: a
+    /// point inside the Browser window is Browser content only when
+    /// the Browser owns the adoption; any other window stacked above
+    /// the Browser wins the hit even inside the adopted rect.
+    pub fn adoption_for_browser_window(&self, window: &Window) -> Option<Adoption> {
+        let id = self
+            .registry
+            .records()
+            .iter()
+            .find(|record| record.window == *window)
+            .map(|record| record.id)?;
+        self.adoptions
+            .iter()
+            .find(|adoption| adoption.browser_surface_id == id)
+            .cloned()
+    }
+
     /// The adopted element's position in global compositor (logical)
     /// coordinates: the Browser window's output position plus the
     /// rect origin. `None` when the Browser window is not mapped.

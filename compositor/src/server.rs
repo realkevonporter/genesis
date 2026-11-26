@@ -51,6 +51,7 @@ use smithay::{
         output::{OutputHandler, OutputManagerState},
         presentation::PresentationState,
         seat::WaylandFocus,
+        selection::data_device::DataDeviceState,
         shell::{
             wlr_layer::{
                 Layer as WlrLayer, LayerSurface as WlrLayerSurface, WlrLayerShellHandler,
@@ -167,6 +168,12 @@ pub struct GenesisState {
     /// `output_manager_state` above.
     pub foreign_toplevel_list_state: ForeignToplevelListState,
     pub foreign_toplevel_manager_state: ForeignToplevelManagerState,
+    /// Clipboard (`wl_data_device`, see `clipboard.rs`): the
+    /// `wl_data_device_manager` global + per-seat selection state.
+    /// Created at startup; retained so the global stays advertised.
+    /// The compositor never reads clipboard contents — the marker
+    /// in `new_selection` lists MIME types only.
+    pub data_device_state: DataDeviceState,
 
     pub seat: Seat<Self>,
     /// The seat's keyboard handle (created once; Stage 2 has one seat).
@@ -377,6 +384,12 @@ impl GenesisState {
         // `foreign_toplevel.rs`).
         let foreign_toplevel_list_state = ForeignToplevelListState::new::<Self>(&dh);
         let foreign_toplevel_manager_state = ForeignToplevelManagerState::new(&dh);
+        // Clipboard: the `wl_data_device_manager` global (see
+        // `clipboard.rs`). Data-control (`zwlr_`/`ext-`) is
+        // deliberately not advertised: no clipboard-manager client
+        // exists yet, and `wl_data_device` covers client-to-client
+        // copy/paste (including Chromium, once Stage 5 lands).
+        let data_device_state = DataDeviceState::new::<Self>(&dh);
         // The idle-notifier's timers need a `LoopHandle<'static, Self>`,
         // which neither backend's loop can supply (standalone's loop is
         // `EventLoop<StandaloneLoop>`, nested has no calloop loop), so
@@ -406,6 +419,7 @@ impl GenesisState {
             cursor_shape_state,
             foreign_toplevel_list_state,
             foreign_toplevel_manager_state,
+            data_device_state,
             seat,
             keyboard,
             pointer,
@@ -832,7 +846,11 @@ impl SeatHandler for GenesisState {
         &mut self.seat_state
     }
 
-    fn focus_changed(&mut self, _seat: &Seat<Self>, focused: Option<&WlSurface>) {
+    fn focus_changed(&mut self, seat: &Seat<Self>, focused: Option<&WlSurface>) {
+        // The clipboard follows keyboard focus: the selection is
+        // offered to the newly focused client, and only that client
+        // may set one (see `clipboard.rs`).
+        crate::clipboard::note_keyboard_focus(self, seat, focused);
         let label = focused.and_then(|surface| {
             self.registry
                 .by_object_id(&surface.id())

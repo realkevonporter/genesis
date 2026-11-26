@@ -34,8 +34,10 @@
 //!   is drawn instead, so the pointer is never invisible — same
 //!   plane-or-GL rule, via `render::DrmRenderElements`.
 //! * No Stage 4 manager global yet (the manager track's work):
-//!   foreign-toplevel list/manager, pointer-constraints, and clipboard
-//!   are not in this backend. The adoption mechanism itself (bridge
+//!   foreign-toplevel list/manager and pointer-constraints are
+//!   not in this backend. The clipboard (`wl_data_device`) IS:
+//!   it lives in the shared `GenesisState`, not in either backend,
+//!   so both backends serve it. The adoption mechanism itself (bridge
 //!   ops, placement, clipping, focus policy — Stage 4, track 1) is
 //!   shared with the nested backend through `adoption.rs` +
 //!   `render.rs` and is live here too.

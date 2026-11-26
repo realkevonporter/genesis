@@ -53,6 +53,7 @@
 mod adoption;
 mod backend;
 mod capture;
+mod clipboard;
 mod cursor;
 mod drm;
 mod foreign_toplevel;

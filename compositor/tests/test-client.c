@@ -316,7 +316,6 @@ struct app {
     struct wl_data_source *data_source;
     struct wl_data_offer *data_offer;
     uint32_t focus_serial;
-    bool clipboard_offered;
     bool clipboard_received;
     int paste_rfd;
     bool clipboard_pasted;
@@ -817,13 +816,23 @@ static const struct wl_data_device_listener data_device_listener = {
     .selection = data_device_selection,
 };
 
-/* Offer the clipboard selection (copy role), on a real input serial. */
+/* Offer the clipboard selection (copy role), on a real input serial.
+ * Re-offers on every keyboard enter: the first enter can race the
+ * second client's mapping — focus moves on before the compositor
+ * processes the set_selection, which it then refuses (only the
+ * focused client may set the selection) — and a single offer would
+ * leave the copy client with no live selection and no retry. The
+ * previous source is destroyed first; no receive can be in flight
+ * from it at re-offer time (the paste client only receives after it
+ * gains focus, which is after the copy client's last enter here). */
 static void clipboard_offer_selection(struct app *app, uint32_t serial)
 {
-    if (!mode_is("clipboard-copy") || app->clipboard_offered || !app->data_device)
+    if (!mode_is("clipboard-copy") || !app->data_device)
         return;
     if (!app->data_manager)
         return;
+    if (app->data_source)
+        wl_data_source_destroy(app->data_source);
     app->data_source = wl_data_device_manager_create_data_source(app->data_manager);
     if (!app->data_source) {
         log_line("CLIPBOARD error: create_data_source returned NULL");
@@ -832,7 +841,6 @@ static void clipboard_offer_selection(struct app *app, uint32_t serial)
     wl_data_source_add_listener(app->data_source, &data_source_listener, app);
     wl_data_source_offer(app->data_source, "text/plain");
     wl_data_device_set_selection(app->data_device, app->data_source, serial);
-    app->clipboard_offered = true;
     log_line("CLIPBOARD COPY OFFERED text=%s", CLIPBOARD_TEXT);
 }
 
@@ -2118,28 +2126,38 @@ int main(int argc, char **argv)
     log_line("M1CLIENT started, waiting for configure");
     if (mode_is("clipboard-paste")) {
         /* Paste role: a manual event loop — it must watch the paste
-         * pipe as well as the display. 20 s without an offer is a
-         * failure, not a hang; 10 s without bytes after the receive
-         * was requested is the same. */
-        long long deadline_ms = now_ms() + 20000;
+         * pipe as well as the display. 60 s without an offer is a
+         * failure, not a hang; 30 s without bytes after the receive
+         * was requested is the same. The deadlines are deliberately
+         * looser than the harness's own 30 s waits: the two pointer
+         * sweeps that focus the windows first can take most of 20 s
+         * on a loaded runner, and the client must still be alive
+         * when the offer finally arrives. */
+        long long deadline_ms = now_ms() + 60000;
         long long bytes_deadline_ms = 0;
         while (1) {
             if (app.clipboard_pasted)
                 return 0;
             if (app.clipboard_received && bytes_deadline_ms == 0)
-                bytes_deadline_ms = now_ms() + 10000;
+                bytes_deadline_ms = now_ms() + 30000;
             if (bytes_deadline_ms && now_ms() > bytes_deadline_ms) {
                 log_line("CLIPBOARD error: paste timed out waiting for bytes");
                 return 1;
             }
             if (!app.clipboard_received && now_ms() > deadline_ms) {
-                log_line("CLIPBOARD error: no offer in 20s");
+                log_line("CLIPBOARD error: no offer in 60s");
                 return 1;
             }
             /* Manual event loop: prepare a display read, then poll
-             * the display fd AND the paste pipe together. */
+             * the display fd AND the paste pipe together. The
+             * prepare_read does NOT flush the outgoing queue, so
+             * flush explicitly — without it the surface creation
+             * and first commit queued above never reach the
+             * compositor, no configure ever arrives, and the client
+             * sits in "waiting for configure" forever. */
             while (wl_display_prepare_read(app.display) != 0)
                 wl_display_dispatch_pending(app.display);
+            wl_display_flush(app.display);
             struct pollfd pfds[2];
             pfds[0].fd = wl_display_get_fd(app.display);
             pfds[0].events = POLLIN;

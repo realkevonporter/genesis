@@ -16,10 +16,10 @@
 #
 # Milestones (each recorded PASS / FAIL / NOT-PROVEN in the ledger at
 # the end; exit 0 when nothing FAILED and no NOT-PROVEN falls outside
-# the declared Track 3 gaps — A9 clipboard, A10 pointer lock — which
-# are missing by design on this branch and named in the PR; any other
-# NOT-PROVEN still fails the run, so a PASS regressing to NOT-PROVEN
-# cannot slip through):
+# the declared Track 3 gaps — A10 pointer lock — which is missing by
+# design on this branch and named in the PR; any other NOT-PROVEN
+# still fails the run, so a PASS regressing to NOT-PROVEN cannot slip
+# through):
 #
 #   A1  clients up: Browser + Chromium stand-ins map, associate, commit
 #   A2  hostile pre-adopt: malformed adopt, wrong version, missing
@@ -107,9 +107,12 @@
 #     registry (adoption.rs), so a direct activation of an adopted
 #     surface IS ignored on this tree — and if it goes through
 #     instead, that is a FAIL, not a named gap.
-#   * A10/A9 NOT-PROVEN (not FAIL) when the compositor does not
+#   * A10 NOT-PROVEN (not FAIL) when the compositor does not
 #     advertise the protocol globals at all — a missing capability is
 #     a named gap, not a wrong behaviour. Any other miss is a FAIL.
+#     (A9 clipboard used to share this escape; it landed with the
+#     data-device implementation, so a missing data-device global
+#     is a FAIL now.)
 #
 # Usage:
 #   compositor/tests/adoption-check.sh [--standalone]
@@ -595,9 +598,12 @@ wait_client_gone() {
 # The grid covers the whole output, including the strips that are only
 # one window wide (browser chrome y=20, browser bottom y=450, left
 # strip x=20) — a coarse grid would never enter the Browser at all
-# once Chromium overlaps it.
+# once Chromium overlaps it. The y=200 row covers the cascade band
+# where the 400x100 stand-in windows land (count 3 -> y 144-244,
+# count 4 -> y 192-292): without it the sweep never enters the paste
+# or lock window, which sit between the y=100 and y=300 rows.
 GRID_X="20 100 300 500 700 900 1100"
-GRID_Y="20 100 300 450 600"
+GRID_Y="20 100 200 300 450 600"
 # sweep_find <log-basename>: move through the grid until the client's
 # log gains a PTR ENTER line; echo "<out-x> <out-y> <local-x> <local-y>".
 # Starts from a neutral point outside every window, so the first entry
@@ -1339,29 +1345,28 @@ fi
 # --- A9: clipboard ------------------------------------------------------------------
 start_client clipboard-copy "$COPY_LOG_NAME" copy.pid
 start_client clipboard-paste "$PASTE_LOG_NAME" paste.pid
+# A9 is a real gate now (clipboard landed): a client that never
+# becomes READY fails — the "missing wl_data_device_manager"
+# NOT-PROVEN escape died with the implementation.
 if ! wait_log "$COPY_LOG_NAME" "CLIPBOARD READY" "copy client READY"; then
-    if log_grep "$COPY_LOG_NAME" "CLIPBOARD error: missing wl_data_device_manager"; then
-        record A9 NOT-PROVEN "compositor does not advertise wl_data_device_manager (clipboard not implemented)"
-    else
-        record A9 FAIL "copy client never became READY"
-    fi
+    record A9 FAIL "copy client never became READY"
     kill_client copy.pid; kill_client paste.pid
 elif ! wait_log "$PASTE_LOG_NAME" "CLIPBOARD READY" "paste client READY"; then
-    if log_grep "$PASTE_LOG_NAME" "CLIPBOARD error: missing wl_data_device_manager"; then
-        record A9 NOT-PROVEN "compositor does not advertise wl_data_device_manager (clipboard not implemented)"
-    else
-        record A9 FAIL "paste client never became READY"
-    fi
+    record A9 FAIL "paste client never became READY"
     kill_client copy.pid; kill_client paste.pid
 else
     A9_OK=1
     # Focus the copy window (click it): keyboard enter carries the
-    # serial the selection is set with.
+    # serial the selection is set with. Click the top-left corner,
+    # not the centre: the cascade overlaps the windows by 48 px and
+    # the paste window (mapped later, on top) covers the copy
+    # window's centre, so a centre click focuses paste instead and
+    # copy never offers until paste's deadline kills it.
     COPY_ORIGIN="$(sweep_find "$COPY_LOG_NAME")" || A9_OK=0
     if [ "$A9_OK" = 1 ]; then
         COPY_OX="$(echo "$COPY_ORIGIN" | awk '{print $1 - $3}')"
         COPY_OY="$(echo "$COPY_ORIGIN" | awk '{print $2 - $4}')"
-        ptr_move $((COPY_OX + 200)) $((COPY_OY + 50)); sleep 0.3
+        ptr_move $((COPY_OX + 20)) $((COPY_OY + 20)); sleep 0.3
         ptr_click; sleep 0.5
         wait_log "$COPY_LOG_NAME" "CLIPBOARD COPY OFFERED" "copy offered" \
             || { record A9 FAIL "copy client never offered the selection after being focused"; A9_OK=0; }
@@ -1373,7 +1378,13 @@ else
         if [ "$A9_OK" = 1 ]; then
             PASTE_OX="$(echo "$PASTE_ORIGIN" | awk '{print $1 - $3}')"
             PASTE_OY="$(echo "$PASTE_ORIGIN" | awk '{print $2 - $4}')"
-            ptr_move $((PASTE_OX + 200)) $((PASTE_OY + 50)); sleep 0.3
+            # Click the paste window's lower half, not its centre:
+            # the copy click raised the copy window above paste, and
+            # the copy window covers the paste window's centre, so a
+            # centre click re-focuses copy instead of paste. The
+            # lower half (local y 75) is below the copy window's
+            # bottom edge, so it is paste-only.
+            ptr_move $((PASTE_OX + 200)) $((PASTE_OY + 75)); sleep 0.3
             ptr_click; sleep 0.5
             if wait_log "$PASTE_LOG_NAME" "CLIPBOARD PASTE text=sevyn-clipboard-4" "paste received"; then
                 wait_client_gone paste.pid || echo "adoption-check: warning: paste client did not exit after pasting (continuing)"
@@ -1784,18 +1795,20 @@ if [ "$BACKEND" = "standalone" ]; then
     preserve_logs
 fi
 # Exit status: any FAIL fails the run. NOT-PROVEN fails it too,
-# EXCEPT the declared Track 3 gaps (A9 clipboard, A10 pointer lock),
-# which are missing by design on this branch and named in the PR —
-# they are recorded in the ledger, not hidden. Any other NOT-PROVEN
-# (e.g. a PASS regressing because a protocol stopped being
-# advertised) still fails the run.
-N_NP_UNEXPECTED="$(grep " NOT-PROVEN " "$LEDGER" | grep -vc "^A9 \|^A10 " || true)"
+# EXCEPT the declared Track 3 gap (A10 pointer lock), which is
+# missing by design on this branch and named in the PR — it is
+# recorded in the ledger, not hidden. (A9 clipboard used to be a
+# second gap; it landed with the data-device implementation, so a
+# NOT-PROVEN there is unexpected now.) Any other NOT-PROVEN (e.g. a
+# PASS regressing because a protocol stopped being advertised) still
+# fails the run.
+N_NP_UNEXPECTED="$(grep " NOT-PROVEN " "$LEDGER" | grep -vc "^A10 " || true)"
 if [ "$N_FAIL" -gt 0 ] || [ "$N_NP_UNEXPECTED" -gt 0 ]; then
-    echo "adoption-check: NOT GREEN — $N_FAIL failed, $N_NP not proven ($N_NP_UNEXPECTED unexpected; A9/A10 are the declared Track 3 gaps)"
+    echo "adoption-check: NOT GREEN — $N_FAIL failed, $N_NP not proven ($N_NP_UNEXPECTED unexpected; A10 is the declared Track 3 gap)"
     exit 1
 fi
 if [ "$N_NP" -gt 0 ]; then
-    echo "adoption-check: PASS with $N_NP declared NOT-PROVEN (Track 3: A9 clipboard, A10 pointer lock)"
+    echo "adoption-check: PASS with $N_NP declared NOT-PROVEN (Track 3: A10 pointer lock)"
 fi
 echo "adoption-check: PASS — all Stage 4 adoption milestones proven ($BACKEND)"
 exit 0
