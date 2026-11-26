@@ -193,6 +193,36 @@ fn hit_test(
             return Some((HitTarget::Layer(surface), leaf, origin));
         }
     }
+    // The topmost Space element at the point, if any. A floating
+    // window stacked above the Browser wins the hit even inside the
+    // adopted rect: the adoption check below must not shadow Space
+    // windows — the render order already draws the adopted content
+    // below any window stacked above the Browser (see
+    // `splice_adopted`), so input must agree, or a window overlapping
+    // the Browser's content area is visible but unclickable there.
+    // Only the adoption's own Browser window falls through to the
+    // adoption check: a point inside its rect is Browser content
+    // (the adopted Chromium), a point outside it is Browser chrome.
+    let space_hit = state
+        .space
+        .element_under(location)
+        .and_then(|(window, window_location)| {
+            let window_point = location - window_location.to_f64();
+            window
+                .surface_under(window_point, WindowSurfaceType::ALL)
+                .map(|(surface, surface_location)| {
+                    (window, window_location, surface, surface_location)
+                })
+        });
+    if let Some((window, window_location, surface, surface_location)) = space_hit.clone() {
+        if state.adoption_for_browser_window(window).is_none() {
+            return Some((
+                HitTarget::Window(window.clone()),
+                surface,
+                window_location + surface_location,
+            ));
+        }
+    }
     for adoption in state.adoptions.clone() {
         let Some(rect) = state.adopted_global_rect(&adoption) else {
             continue;
@@ -223,17 +253,12 @@ fn hit_test(
             adopted_location + surface_location,
         ));
     }
-    if let Some((window, window_location)) = state.space.element_under(location) {
-        let window_point = location - window_location.to_f64();
-        if let Some((surface, surface_location)) =
-            window.surface_under(window_point, WindowSurfaceType::ALL)
-        {
-            return Some((
-                HitTarget::Window(window.clone()),
-                surface,
-                window_location + surface_location,
-            ));
-        }
+    if let Some((window, window_location, surface, surface_location)) = space_hit {
+        return Some((
+            HitTarget::Window(window.clone()),
+            surface,
+            window_location + surface_location,
+        ));
     }
     // Layers below windows last.
     for layer in [WlrLayer::Bottom, WlrLayer::Background] {

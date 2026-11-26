@@ -23,10 +23,11 @@ parent owns the hardware. Standalone is Stage 3.
 
 What Stage 2 serves (and nothing else): core Wayland, `wl_shm`,
 `wl_output` (+ `xdg-output`), `wl_seat` (pointer + keyboard), and
-`xdg-shell` — one output, one seat. No data-device/clipboard, no
-dmabuf, no XWayland, no fractional scaling: those arrive with their
-stages (see the plan's per-stage map). Stage 3 adds the protocols
-listed under "Stage 3 — protocols" below.
+`xdg-shell` — one output, one seat. No dmabuf, no XWayland, no
+fractional scaling: those arrive with their stages (see the plan's
+per-stage map). Stage 3 adds the protocols listed under "Stage 3 —
+protocols" below; the data-device clipboard arrived with Stage 4
+(`compositor/src/clipboard.rs`, proven by adoption-check A9).
 
 ### Layout
 
@@ -221,9 +222,11 @@ The same script runs in CI.
   and the bridge markers are the association record the Runtime will
   consume. Process launch by the compositor is a Stage 3/Runtime item.
 - **Adoption + foreign-toplevel manager/list are both implemented**
-  (Stage 4, see below). The remaining gaps are pointer-constraints,
-  clipboard, and latency measurement (input track, not landed) and
-  real Shell/Chromium embedding (Stage 5 work).
+  (Stage 4, see below), as is the data-device clipboard
+  (`compositor/src/clipboard.rs`, proven by adoption-check A9). The
+  remaining gaps are pointer-constraints and latency measurement
+  (input track, not landed) and real Shell/Chromium embedding
+  (Stage 5 work).
 - **No dmabuf proof, no frame-rate claim.** SHM is the buffer path in
   the nested check; the dmabuf global exists in standalone mode and
   imports into the active renderer, but the zero-copy path and 60 fps
@@ -332,10 +335,9 @@ not shipped):
 
 **Not added (Stage 4 / follow-ups, per the plan — left out
 deliberately, not forgotten):** pointer-constraints +
-relative-pointer (Stage 4), data-device clipboard (Stage 4),
-screencopy, input-method + text-input, virtual keyboard, tablet,
-session lock, fractional scaling, XWayland. See
-`COMPOSITOR_PLAN.md`, "Fully equipped".
+relative-pointer (Stage 4), screencopy, input-method + text-input,
+virtual keyboard, tablet, session lock, fractional scaling,
+XWayland. See `COMPOSITOR_PLAN.md`, "Fully equipped".
 
 ### Cursor
 
