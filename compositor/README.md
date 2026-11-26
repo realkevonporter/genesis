@@ -178,6 +178,42 @@ downstream by the QMP screendump oracle in the SevynOS m13 check —
 and the default output path `/data/screen/latest.png` is proven
 on-device at the GF65 gate. The same script runs in CI.
 
+### The real-Chromium adoption check
+
+```sh
+compositor/tests/real-chromium-adoption-check.sh
+```
+
+Boots the same nested stack and proves the Stage 5 Genesis bar with
+the REAL client (not the test-client stand-in): a real Chromium
+snapshot (revision 1738523, the snapshot `sevyn browser` launches)
+is adopted via the bridge `adopt` op into a Browser rect, and a
+`capture` proves the same buffer relocated — the page's red pixel
+count matches the pre-adopt capture within 2% — with no red,
+inactive-titlebar, or infobar pixel anywhere outside the rect (that
+full-image scan is the "no second window" and clipping proof in
+one), and the union of the three parts starts at the rect origin:
+the Chromium window's GEOMETRY lands at the rect origin. The page
+is a sub-rectangle of the window — titlebar + infobar + shadow
+margins sit around it — so the check never claims the page "fills"
+the rect. A bridge `resize` then proves real Chromium honours the
+compositor configure (it commits a new size and the colour follows
+the new rect without moving), and killing Chromium proves the
+`chromium_died` event fires and the content area empties back to the
+Browser's own content colour without killing the app. Building the
+check exposed one real gap, fixed in the same PR: the adopted
+element was placed by its buffer origin, so real Chromium (whose
+geometry is inset by its shadow margins) rendered 16 px right and
+10 px down from the rect origin — see
+`GenesisState::adopted_buffer_origin` in `src/adoption.rs`; the
+test-client stand-in has geometry.loc (0,0) and could never catch
+it. The PNG is decoded with the same stdlib-only decoder as the
+capture check. The dmabuf path is not re-proven here (the Stage 4
+spike proves it; under this nested backend Chromium may render
+through SHM/llvmpipe — the pixels are the proof, not the buffer
+type), and drag/focus with the real client stay GF65-gate proofs.
+The same script runs in CI.
+
 ### Not yet (named, not claimed)
 
 - **No Shell, no Runtime.** The Shell (RN host) and the Runtime do not

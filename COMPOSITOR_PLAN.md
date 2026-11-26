@@ -910,6 +910,26 @@ Stage 4 mechanism, and proves the bar.
 7. **GF65: 60 fps sustained** (scrolling, navigation) with the dmabuf
    path active — the only proof of the bar.
 
+The Genesis half of items 1, 3, and 5 is proven in CI by
+`compositor/tests/real-chromium-adoption-check.sh` (R1/R2/R3): a real
+Chromium snapshot (revision 1738523, the snapshot `sevyn browser`
+launches) is adopted into a Browser rect and a `capture` proves the
+same buffer relocated (red count matches the pre-adopt capture
+within 2%) with no red, titlebar, or infobar pixel outside the rect
+and the window's geometry at the rect origin; a bridge `resize`
+proves Chromium honours the compositor configure; killing Chromium
+proves the `chromium_died` event and the emptied content area.
+Building the check exposed one real gap, fixed in the same PR: the
+adopted element was placed by its buffer origin, so real Chromium
+(whose geometry is inset by its shadow margins) rendered 16 px
+right and 10 px down from the rect origin — the render path now
+subtracts the geometry offset (see
+`GenesisState::adopted_buffer_origin`); the test-client stand-in
+has geometry.loc (0,0) and could never catch it. Drag (item 2),
+focus (item 4), and the `browser status` line (item 6) stay
+GF65-gate proofs with the real Browser app, as do the SevynOS
+host/CLI/Browser.tsx halves of items 1, 3, and 5.
+
 ## Failure without fallback
 
 Weston is not the fallback, so the plan must say what happens when

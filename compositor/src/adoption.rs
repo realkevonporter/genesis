@@ -35,6 +35,11 @@
 //! the Browser window's output position plus the rect origin, wrapped
 //! in Smithay's [`CropRenderElement`] clipped to the rect — Chromium
 //! pixels can never paint outside the content area, in either backend.
+//! "At the rect origin" means the window's GEOMETRY origin (see
+//! [`GenesisState::adopted_buffer_origin`]): the surface tree is
+//! positioned by its buffer origin, so the geometry offset is
+//! subtracted first — otherwise a client with an inset geometry
+//! (real Chromium) renders shifted inside the rect.
 //! The placement is computed at render time from the Browser window's
 //! live position, so a Browser move repositions the adopted element
 //! by the same delta in the same frame: the pairing is structural,
@@ -200,6 +205,11 @@ impl GenesisState {
     /// Computed at render time from the Browser window's live
     /// position, so a Browser move moves the adopted element in the
     /// same frame — no separate move step exists to drift.
+    ///
+    /// This is the GEOMETRY origin: the position the window's
+    /// `set_window_geometry` rect lands at. The surface tree itself
+    /// is positioned by its buffer origin — see
+    /// [`Self::adopted_buffer_origin`].
     pub fn adopted_location(&self, adoption: &Adoption) -> Option<Point<i32, Logical>> {
         let browser = self.registry.get(adoption.browser_surface_id)?;
         let location = self.space.element_location(&browser.window)?;
@@ -207,6 +217,38 @@ impl GenesisState {
             location.x + adoption.rect.x,
             location.y + adoption.rect.y,
         )))
+    }
+
+    /// The adopted Chromium surface's BUFFER origin in global
+    /// compositor (logical) coordinates: the geometry origin
+    /// ([`Self::adopted_location`]) minus the window's geometry
+    /// offset within its buffer.
+    ///
+    /// `render_elements_from_surface_tree` positions a surface tree
+    /// by its buffer origin, while the Space renders a window's
+    /// buffer at `location - geometry.loc` — the geometry origin is
+    /// the position, the buffer hangs off it by the geometry offset.
+    /// The two must agree, or the adopted window renders shifted by
+    /// that offset inside the rect. A client whose geometry is inset
+    /// within its buffer exposes the difference: real Chromium sets
+    /// a window geometry inset by its shadow margins
+    /// (geometry.loc = (16,10)), so without this subtraction the
+    /// adopted window lands 16 px right and 10 px down from the rect
+    /// origin, and pointer routing (which already treats
+    /// `adopted_location` as the geometry origin — see `input.rs`
+    /// `hit_test`) disagrees with the rendered pixels by the same
+    /// offset. The test-client stand-in has geometry.loc (0,0), so
+    /// the adoption check never caught it; the Stage 5
+    /// real-Chromium check did (see
+    /// `compositor/tests/real-chromium-adoption-check.sh`, R1).
+    pub fn adopted_buffer_origin(&self, adoption: &Adoption) -> Option<Point<i32, Logical>> {
+        let location = self.adopted_location(adoption)?;
+        let offset = self
+            .registry
+            .get(adoption.chromium_surface_id)
+            .map(|record| record.window.geometry().loc)
+            .unwrap_or_default();
+        Some(Point::from((location.x - offset.x, location.y - offset.y)))
     }
 
     /// The adopted element's clip rect in global compositor (logical)

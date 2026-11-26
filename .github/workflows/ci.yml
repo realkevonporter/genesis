@@ -84,6 +84,41 @@ jobs:
       - name: Run the screen capture check
         run: compositor/tests/capture-check.sh
 
+      # The real-Chromium adoption check (Stage 5): boots the same
+      # nested stack, launches a real Chromium snapshot against it,
+      # adopts it into a Browser rect over the bridge, and proves the
+      # same buffer relocated with its geometry at the rect origin
+      # and no page/titlebar/infobar pixel outside it (no second
+      # window, clipped) — then resize via compositor configure and
+      # Chromium death emptying the content area.
+      # (The libraries below are the snapshot's link closure, as in
+      # the Stage 4 spike's guest package list; unzip is the
+      # snapshot's unpacker.)
+      - name: Run the real-Chromium adoption check
+        run: |
+          sudo apt-get install -y -qq \
+            unzip \
+            libnss3 \
+            libnspr4 \
+            libatk1.0-0t64 \
+            libatk-bridge2.0-0t64 \
+            libcups2t64 \
+            libdrm2 \
+            libxkbcommon0 \
+            libxcomposite1 \
+            libxdamage1 \
+            libxfixes3 \
+            libxrandr2 \
+            libasound2t64 \
+            libpango-1.0-0 \
+            libcairo2 \
+            libatspi2.0-0t64 \
+            libexpat1 \
+            libxcb1 \
+            libxext6 \
+            fonts-liberation
+          compositor/tests/real-chromium-adoption-check.sh
+
   format:
     runs-on: ubuntu-24.04
     steps:
