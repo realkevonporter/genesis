@@ -76,6 +76,14 @@ jobs:
           sudo apt-get install -y -qq libegl-mesa0
           compositor/tests/nested-check.sh
 
+      # The screen-capture check: boots the same nested stack and
+      # proves the bridge `capture` op — a valid PNG with the
+      # compositor's actual pixels, overwrite with no history, S3
+      # refusal for sensitive layer + toplevel stand-ins, and
+      # malformed requests leaving the compositor alive.
+      - name: Run the screen capture check
+        run: compositor/tests/capture-check.sh
+
   format:
     runs-on: ubuntu-24.04
     steps:

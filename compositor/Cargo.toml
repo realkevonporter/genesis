@@ -77,3 +77,13 @@ serde_json = "1"
 # lockfile as a transitive dependency (0.3.12); listed directly with
 # the `server` feature only — Genesis is the server side here.
 wayland-protocols-wlr = { version = "0.3", features = ["server"] }
+# PNG encoding for the bridge `capture` op (see `capture.rs`): the
+# `png` crate encodes the read-back RGBA buffer as `latest.png`.
+# Pure Rust, no system library; already fetched from crates.io.
+png = "0.18"
+# The `pixman` crate's `Image` type, so the DRM backend's Pixman
+# renderer arm can name the offscreen target of Smithay's
+# `Offscreen<Image>` impl in the shared capture path (see
+# `capture.rs`). Already in the lockfile as a transitive dependency
+# (0.2.1) via Smithay; listed directly so the use is explicit.
+pixman = "0.2"

@@ -102,8 +102,10 @@ use smithay::{
         egl::{EGLContext, EGLDisplay},
         libinput::{LibinputInputBackend, LibinputSessionInterface},
         renderer::{
-            gles::GlesRenderer, pixman::PixmanRenderer, Bind, Color32F, ImportAll, ImportDma,
-            ImportDmaWl, ImportMem, ImportMemWl, Renderer, Texture,
+            gles::{GlesRenderer, GlesTexture},
+            pixman::PixmanRenderer,
+            Bind, Color32F, ExportMem, ImportAll, ImportDma, ImportDmaWl, ImportMem, ImportMemWl,
+            Offscreen, Renderer, Texture,
         },
         session::{libseat::LibSeatSession, Event as SessionEvent, Session},
         udev::{UdevBackend, UdevEvent},
@@ -455,25 +457,43 @@ fn create_gles_renderer(
 /// Returns `true` when a frame was queued (page-flip scheduled).
 /// The renderer is taken out of the state for the render and put back
 /// afterwards: the borrow cannot overlap the state's own borrow.
+///
+/// A pending capture is served after the presented frame, even when
+/// the frame itself failed or was empty: the offscreen render is
+/// independent of the DRM compositor's damage tracker and page-flip
+/// queue, so a capture request always gets its reply.
 fn render_drm(data: &mut StandaloneLoop) -> Result<bool, Box<dyn std::error::Error>> {
     let StandaloneLoop { state, drm, .. } = data;
     if drm.paused {
+        crate::capture::fail_pending_capture(state, "output paused");
         return Ok(false);
     }
     let Some(output) = drm.output.as_mut() else {
+        crate::capture::fail_pending_capture(state, "no output");
         return Ok(false);
     };
     let Some(renderer) = state.drm_renderer.take() else {
+        crate::capture::fail_pending_capture(state, "no renderer");
         return Ok(false);
     };
     let presented = match renderer {
         DrmRenderer::Gles(mut renderer) => {
             let result = render_with(state, &mut output.compositor, &mut *renderer);
+            if let Some(request) = state.capture_request.take() {
+                run_capture_drm::<GlesRenderer, GlesTexture>(state, &mut *renderer, request);
+            }
             state.drm_renderer = Some(DrmRenderer::Gles(renderer));
             result?
         }
         DrmRenderer::Pixman(mut renderer) => {
             let result = render_with(state, &mut output.compositor, &mut renderer);
+            if let Some(request) = state.capture_request.take() {
+                run_capture_drm::<PixmanRenderer, pixman::Image<'static, 'static>>(
+                    state,
+                    &mut renderer,
+                    request,
+                );
+            }
             state.drm_renderer = Some(DrmRenderer::Pixman(renderer));
             result?
         }
@@ -503,25 +523,17 @@ fn render_drm(data: &mut StandaloneLoop) -> Result<bool, Box<dyn std::error::Err
     Ok(presented)
 }
 
-/// Render the scene with one concrete renderer and queue the frame.
-/// `DrmCompositor::render_frame` consults its internal damage tracker
-/// (`backend::renderer::damage`'s `OutputDamageTracker`): only damaged
-/// regions redraw, and an unchanged scene reports an empty frame, in
-/// which case nothing is queued. A queued frame is submitted to the
-/// CRTC and presented on the next page-flip (vsync); the cursor
-/// element, appended last and marked `Kind::Cursor`, is what the
-/// compositor considers for the hardware cursor plane — the
-/// client-set surface when there is one, the built-in default arrow
-/// otherwise (see `render::default_cursor_element`). Elements are
-/// wrapped in `DrmRenderElements` because the default arrow is a
-/// memory-backed element, not a surface element.
-fn render_with<R>(
-    state: &mut GenesisState,
-    compositor: &mut GenesisDrmCompositor,
+/// Collect the DRM scene's element list (space + adopted + popups +
+/// cursor), in draw order. Shared by the presented frame and the
+/// capture pass so both render the same scene — including the cursor,
+/// which the standalone backend draws but the nested backend leaves
+/// to the parent compositor.
+fn collect_drm_elements<R>(
+    state: &GenesisState,
     renderer: &mut R,
-) -> Result<bool, Box<dyn std::error::Error>>
+) -> Result<Vec<DrmRenderElements<R>>, Box<dyn std::error::Error>>
 where
-    R: Renderer + Bind<Dmabuf> + ImportAll + ImportMem + ImportMemWl + ImportDmaWl,
+    R: Renderer + ImportAll + ImportMem + ImportMemWl + ImportDmaWl,
     R::TextureId: Clone + Texture + Send + 'static,
     R::Error: 'static,
 {
@@ -571,6 +583,74 @@ where
     } else if let Some(cursor) = default_cursor_element(state, renderer) {
         elements.push(DrmRenderElements::Memory(cursor));
     }
+    Ok(elements)
+}
+
+/// Serve one pending capture on the standalone backend: re-check the
+/// S3 rule against the scene as it stands now, render the scene into
+/// an offscreen target with the concrete renderer, and resolve the
+/// request (PNG written, or refusal) into `state.capture_reply`.
+/// `T` names the renderer's offscreen target (`GlesTexture` /
+/// Pixman `Image`) — the two `render_drm` arms pass it explicitly,
+/// since Smithay implements `Offscreen` for both. The capture
+/// renders into its own offscreen target, never into the DRM
+/// swapchain, and never touches the damage tracker or page-flip
+/// queue. Its pixels are proven downstream (the QMP screendump
+/// oracle in the SevynOS m13 check), not in this repo's CI — CI has
+/// no DRM device.
+fn run_capture_drm<R, T>(
+    state: &mut GenesisState,
+    renderer: &mut R,
+    request: crate::capture::CaptureRequest,
+) where
+    R: Renderer + Offscreen<T> + ExportMem + ImportAll + ImportMem + ImportMemWl + ImportDmaWl,
+    R::TextureId: Clone + Texture + Send + 'static,
+    R::Error: std::fmt::Debug + 'static,
+{
+    if let Some(detail) = crate::capture::sensitive_surface_visible(state) {
+        marker!("CAPTURE REFUSED reason=sensitive-surface detail={detail}");
+        state.capture_reply = Some(crate::runtime_bridge::capture_err_json(
+            "refused: sensitive surface",
+        ));
+        return;
+    }
+    // The offscreen buffer is the output's physical size (the mode
+    // size through the output transform — the same size the DRM
+    // compositor presents).
+    let size = state
+        .output_transform
+        .transform_size(state.output_physical_size);
+    let outcome = (|| -> Result<crate::capture::CapturedFrame, String> {
+        let elements = collect_drm_elements(state, renderer)
+            .map_err(|err| format!("capture failed: cannot collect scene: {err}"))?;
+        crate::capture::capture_offscreen::<R, T, DrmRenderElements<R>>(renderer, &elements, size)
+    })();
+    crate::capture::resolve_capture(state, request, outcome);
+}
+
+/// Render the scene with one concrete renderer and queue the frame.
+/// `DrmCompositor::render_frame` consults its internal damage tracker
+/// (`backend::renderer::damage`'s `OutputDamageTracker`): only damaged
+/// regions redraw, and an unchanged scene reports an empty frame, in
+/// which case nothing is queued. A queued frame is submitted to the
+/// CRTC and presented on the next page-flip (vsync); the cursor
+/// element, appended last and marked `Kind::Cursor`, is what the
+/// compositor considers for the hardware cursor plane — the
+/// client-set surface when there is one, the built-in default arrow
+/// otherwise (see `render::default_cursor_element`). Elements are
+/// wrapped in `DrmRenderElements` because the default arrow is a
+/// memory-backed element, not a surface element.
+fn render_with<R>(
+    state: &mut GenesisState,
+    compositor: &mut GenesisDrmCompositor,
+    renderer: &mut R,
+) -> Result<bool, Box<dyn std::error::Error>>
+where
+    R: Renderer + Bind<Dmabuf> + ImportAll + ImportMem + ImportMemWl + ImportDmaWl,
+    R::TextureId: Clone + Texture + Send + 'static,
+    R::Error: 'static,
+{
+    let elements = collect_drm_elements(state, renderer)?;
     let frame = compositor.render_frame(
         renderer,
         &elements,
