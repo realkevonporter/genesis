@@ -12,7 +12,9 @@
 //! the same manager. This is the minimal correct xdg-shell surface: no
 //! popup is ever silently dropped.
 
-use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::State as ToplevelState;
+use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::{
+    ResizeEdge, State as ToplevelState,
+};
 use smithay::{
     desktop::{PopupKind, Window},
     reexports::wayland_server::{protocol::wl_seat::WlSeat, Resource},
@@ -27,6 +29,7 @@ use smithay::{
 };
 
 use crate::{
+    grabs::{start_move_grab, start_resize_grab},
     marker,
     runtime_bridge::{self, SessionAssociation, SessionId},
     server::GenesisState,
@@ -90,6 +93,46 @@ impl XdgShellHandler for GenesisState {
             self.space.unmap_elem(&window);
         }
         self.needs_redraw = true;
+    }
+
+    fn move_request(&mut self, surface: ToplevelSurface, _seat: WlSeat, serial: Serial) {
+        // Interactive move, started by the host from a title-bar
+        // press via `xdg_toplevel_move`. Stage 2 has exactly one
+        // seat (see `grab` below), so the request always targets it.
+        // Without this handler Smithay drops the request and the
+        // window never moves (SevynOS PR #185 genesis-check).
+        let Some(window) = self
+            .registry
+            .for_toplevel(&surface)
+            .map(|record| record.window.clone())
+        else {
+            return;
+        };
+        start_move_grab(self, window, serial);
+    }
+
+    fn resize_request(
+        &mut self,
+        surface: ToplevelSurface,
+        _seat: WlSeat,
+        serial: Serial,
+        edges: ResizeEdge,
+    ) {
+        // Interactive resize, started by the host from an edge press
+        // via `xdg_toplevel_resize`. Same one-seat note as above;
+        // without this handler the request is dropped and the window
+        // never resizes (SevynOS PR #185 genesis-check).
+        if edges == ResizeEdge::None {
+            return;
+        }
+        let Some(window) = self
+            .registry
+            .for_toplevel(&surface)
+            .map(|record| record.window.clone())
+        else {
+            return;
+        };
+        start_resize_grab(self, window, surface, edges, serial);
     }
 
     fn new_popup(&mut self, surface: PopupSurface, _positioner: PositionerState) {

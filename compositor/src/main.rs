@@ -57,6 +57,7 @@ mod clipboard;
 mod cursor;
 mod drm;
 mod foreign_toplevel;
+mod grabs;
 mod idle;
 mod input;
 mod logging;
