@@ -229,10 +229,19 @@ pub fn send_frames_surface_tree(surface: &WlSurface, time: u32) {
     );
 }
 
-/// Send frame callbacks for every live toplevel, at the given time.
+/// Send frame callbacks for every live toplevel and every live layer
+/// surface, at the given time. Layer surfaces are clients too: the
+/// shell is a layer-shell Background surface, and without a callback
+/// after each present it stalls waiting for the next frame — with swap
+/// interval 1 the client's second swap blocks forever. Popups are
+/// part of their parent's tree walk.
 pub fn send_frames(state: &GenesisState, time: u32) {
     for surface in state.xdg_shell_state.toplevel_surfaces() {
         send_frames_surface_tree(surface.wl_surface(), time);
+    }
+    let layer_map = layer_map_for_output(&state.output);
+    for layer in layer_map.layers() {
+        send_frames_surface_tree(layer.wl_surface(), time);
     }
 }
 
