@@ -17,7 +17,10 @@ use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::{
 };
 use smithay::{
     desktop::{PopupKind, Window},
-    reexports::wayland_server::{protocol::wl_seat::WlSeat, Resource},
+    reexports::wayland_server::{
+        protocol::{wl_output::WlOutput, wl_seat::WlSeat},
+        Resource,
+    },
     utils::Serial,
     wayland::{
         compositor::with_states,
@@ -133,6 +136,52 @@ impl XdgShellHandler for GenesisState {
             return;
         };
         start_resize_grab(self, window, surface, edges, serial);
+    }
+
+    // Client-initiated maximize / fullscreen (polish surface (b)):
+    // the client asks via `xdg_toplevel.set_maximized` /
+    // `set_fullscreen` — the host's double-click maximize and its
+    // middle-button fullscreen both go through here. Smithay's
+    // default for these requests is a bare `send_configure()` (or
+    // nothing), so without these handlers the request is silently
+    // dropped: the client defers presents awaiting a configure that
+    // never comes and the window freezes (SevynOS #203
+    // genesis-check: `WAYLAND maximize` logged, no configure, fps
+    // 0.0). Delegate to the foreign-toplevel manager path, which
+    // sets the state, configures the work-area / output size, and
+    // moves the window — one code path for both triggers, so a
+    // manager request and a client request agree. An unregistered
+    // surface falls back to Smithay's default configure.
+    fn maximize_request(&mut self, surface: ToplevelSurface) {
+        let Some(id) = self.registry.for_toplevel(&surface).map(|record| record.id) else {
+            surface.send_configure();
+            return;
+        };
+        self.manager_set_maximized(id, true);
+    }
+
+    fn unmaximize_request(&mut self, surface: ToplevelSurface) {
+        let Some(id) = self.registry.for_toplevel(&surface).map(|record| record.id) else {
+            surface.send_configure();
+            return;
+        };
+        self.manager_set_maximized(id, false);
+    }
+
+    fn fullscreen_request(&mut self, surface: ToplevelSurface, _output: Option<WlOutput>) {
+        let Some(id) = self.registry.for_toplevel(&surface).map(|record| record.id) else {
+            surface.send_configure();
+            return;
+        };
+        self.manager_set_fullscreen(id, true);
+    }
+
+    fn unfullscreen_request(&mut self, surface: ToplevelSurface) {
+        let Some(id) = self.registry.for_toplevel(&surface).map(|record| record.id) else {
+            surface.send_configure();
+            return;
+        };
+        self.manager_set_fullscreen(id, false);
     }
 
     fn new_popup(&mut self, surface: PopupSurface, _positioner: PositionerState) {

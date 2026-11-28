@@ -376,7 +376,59 @@ pub fn pointer_button(
 ) {
     state.note_input_activity();
     if button_state == ButtonState::Pressed {
-        match hit_test(state, state.pointer_location) {
+        let hit = hit_test(state, state.pointer_location);
+        // Re-sync the pointer (dispatch) focus to the surface
+        // actually under the pointer at press time, when it
+        // disagrees with the motion focus. The dispatch focus is
+        // set by motion events only, so after a drag/resize it
+        // can be stale: the pointer rests on the window but the
+        // focus still points at the shell (it flipped to the
+        // shell mid-drag, while the window was still growing
+        // under the pointer, and no motion event re-ran the hit
+        // test after the drag ended — the pointer did not move).
+        // The press would then go to the shell and the window
+        // would never see it: no resize grab on an edge
+        // drag-back, no move grab, no double-click. A press must
+        // go to the surface under the pointer, so update the
+        // focus from this press-time hit test before dispatching
+        // — the same focus `pointer_motion` would compute at this
+        // location. A no-op when the focus already agrees.
+        let (focus_id, focus_layer) = match &hit {
+            Some((HitTarget::Window(window), _, _)) => (
+                state
+                    .registry
+                    .records()
+                    .iter()
+                    .find(|record| record.window == *window)
+                    .map(|record| record.id),
+                None,
+            ),
+            Some((HitTarget::Layer(layer), _, _)) => (None, Some(layer.namespace().to_string())),
+            None => (None, None),
+        };
+        if focus_id != state.pointer_focus_id || focus_layer != state.pointer_focus_layer {
+            state.pointer_focus_id = focus_id;
+            state.pointer_focus_layer = focus_layer.clone();
+            marker!(
+                "POINTER FOCUS surface={} x={} y={}",
+                focus_id
+                    .map(|id| id.to_string())
+                    .or_else(|| focus_layer.map(|namespace| format!("layer={namespace}")))
+                    .unwrap_or_else(|| "(none)".to_string()),
+                state.pointer_location.x as i32,
+                state.pointer_location.y as i32
+            );
+            let focus = hit.as_ref().map(|(_target, surface, surface_location)| {
+                (surface.clone(), surface_location.to_f64())
+            });
+            let motion = MotionEvent {
+                location: state.pointer_location,
+                serial,
+                time,
+            };
+            state.pointer.clone().motion(state, focus, &motion);
+        }
+        match hit {
             Some((HitTarget::Window(window), _surface, _location)) => {
                 let (raise, adopted) = focus_target(state, &window);
                 state.space.raise_element(&raise, true);
