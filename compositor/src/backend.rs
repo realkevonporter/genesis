@@ -52,7 +52,7 @@ use std::{
 use smithay::{
     backend::{
         renderer::{
-            element::surface::WaylandSurfaceRenderElement,
+            element::{surface::WaylandSurfaceRenderElement, Element},
             gles::{GlesRenderer, GlesTexture},
             utils::draw_render_elements,
             Color32F, Frame, Renderer,
@@ -66,7 +66,7 @@ use smithay::{
             dpi::LogicalSize, platform::pump_events::PumpStatus, window::Window as WinitWindow,
         },
     },
-    utils::{Logical, Physical, Rectangle, Size, Transform},
+    utils::{Logical, Physical, Rectangle, Scale, Size, Transform},
 };
 
 use crate::{
@@ -75,6 +75,7 @@ use crate::{
         adopted_elements, popup_elements, send_frames, send_presentation_feedback, splice_adopted,
         NestedRenderElements,
     },
+    rounded::{ensure_rounded_program, roundable_windows, rounded_element_for},
     runtime_bridge::BridgeServer,
     server::{ClientEvent, ClientState, GenesisState},
 };
@@ -90,7 +91,7 @@ extern "C" fn on_signal(_signal: libc::c_int) {
 /// The nested scene's element lists: the space / adopted elements
 /// and the popups above them (see `collect_nested_elements`).
 type NestedSceneElements = (
-    Vec<NestedRenderElements<GlesRenderer>>,
+    Vec<NestedRenderElements>,
     Vec<WaylandSurfaceRenderElement<GlesRenderer>>,
 );
 
@@ -109,7 +110,7 @@ fn collect_nested_elements(
     let space_elements = state
         .space
         .render_elements_for_output(renderer, &state.output, 1.0)?;
-    let mut elements: Vec<NestedRenderElements<GlesRenderer>> = space_elements
+    let mut elements: Vec<NestedRenderElements> = space_elements
         .into_iter()
         .map(|element| match element {
             smithay::desktop::space::SpaceRenderElements::Surface(element) => {
@@ -123,22 +124,54 @@ fn collect_nested_elements(
             }
         })
         .collect();
-    let adopted: Vec<(
-        smithay::desktop::Window,
-        Vec<NestedRenderElements<GlesRenderer>>,
-    )> = adopted_elements(state, renderer, 1.0)
-        .into_iter()
-        .map(|(window, cropped)| {
-            (
-                window,
-                cropped
-                    .into_iter()
-                    .map(NestedRenderElements::Cropped)
-                    .collect(),
-            )
-        })
-        .collect();
+    let adopted: Vec<(smithay::desktop::Window, Vec<NestedRenderElements>)> =
+        adopted_elements(state, renderer, 1.0)
+            .into_iter()
+            .map(|(window, cropped)| {
+                (
+                    window,
+                    cropped
+                        .into_iter()
+                        .map(NestedRenderElements::Cropped)
+                        .collect(),
+                )
+            })
+            .collect();
     elements = splice_adopted(elements, adopted);
+    // Polish surface (b): round the corners of normal-state toplevel
+    // windows. The swap runs after the adoption splice so the adopted
+    // elements (Cropped) are already placed; only Wrapped roots are
+    // ever replaced, in place, so stacking order is preserved. When
+    // there is no program yet (or a surface has no buffer) the plain
+    // element stays and the next frame retries.
+    if let Some(program) = &state.rounded_program {
+        let roundable = roundable_windows(state);
+        if !roundable.is_empty() {
+            let scale = Scale::from(1.0);
+            elements = elements
+                .into_iter()
+                .map(|element| {
+                    let NestedRenderElements::Wrapped(wrapped) = &element else {
+                        return element;
+                    };
+                    let Some(surface) = roundable.get(wrapped.id()) else {
+                        return element;
+                    };
+                    let Some(rounded) = rounded_element_for(
+                        renderer,
+                        program,
+                        surface,
+                        wrapped.location(scale),
+                        wrapped.alpha(),
+                        wrapped.kind(),
+                    ) else {
+                        return element;
+                    };
+                    NestedRenderElements::Rounded(rounded)
+                })
+                .collect();
+        }
+    }
     let popups = popup_elements(state, renderer, 1.0);
     Ok((elements, popups))
 }
@@ -174,21 +207,22 @@ fn run_capture(
         let (renderer, _window_target) = backend
             .bind()
             .map_err(|err| format!("capture failed: cannot bind window: {err:?}"))?;
+        // Polish surface (b): the rounded-corner program is compiled
+        // lazily on the first frame (see `render_frame`).
+        ensure_rounded_program(state, renderer);
         let (mut elements, popups) = collect_nested_elements(state, renderer)
             .map_err(|err| format!("capture failed: cannot collect scene: {err}"))?;
         // Popups first: `draw_render_elements` draws the list in
         // reverse, so the first element is topmost — the same order
         // the presented frame draws (elements, then popups).
-        let mut combined: Vec<NestedRenderElements<GlesRenderer>> = popups
+        let mut combined: Vec<NestedRenderElements> = popups
             .into_iter()
             .map(NestedRenderElements::Surface)
             .collect();
         combined.append(&mut elements);
-        crate::capture::capture_offscreen::<
-            GlesRenderer,
-            GlesTexture,
-            NestedRenderElements<GlesRenderer>,
-        >(renderer, &combined, size)
+        crate::capture::capture_offscreen::<GlesRenderer, GlesTexture, NestedRenderElements>(
+            renderer, &combined, size,
+        )
     })();
     crate::capture::resolve_capture(state, request, outcome);
 }
@@ -229,6 +263,9 @@ fn render_frame(
         // teardown), so the whole render must finish — and the borrow
         // must end — before `submit` borrows the backend again.
         let (renderer, mut framebuffer) = backend.bind()?;
+        // Polish surface (b): compile the rounded-corner program on
+        // the first frame (lazy — the renderer is created by the bind).
+        ensure_rounded_program(state, renderer);
         let (elements, popups) = collect_nested_elements(state, renderer)?;
 
         let mut frame = renderer.render(&mut framebuffer, size, Transform::Flipped180)?;

@@ -104,6 +104,10 @@ use smithay::{
         egl::{EGLContext, EGLDisplay},
         libinput::{LibinputInputBackend, LibinputSessionInterface},
         renderer::{
+            element::{
+                memory::MemoryRenderBufferRenderElement, surface::WaylandSurfaceRenderElement,
+                utils::CropRenderElement, Element, RenderElement, Wrap,
+            },
             gles::{GlesRenderer, GlesTexture},
             pixman::PixmanRenderer,
             Bind, Color32F, ExportMem, ImportAll, ImportDma, ImportDmaWl, ImportMem, ImportMemWl,
@@ -121,7 +125,7 @@ use smithay::{
         rustix::fs::OFlags,
         wayland_server::{Client, Display, DisplayHandle},
     },
-    utils::{Logical, Physical, Size, Transform},
+    utils::{Logical, Physical, Scale, Size, Transform},
     wayland::{dmabuf::DmabufFeedbackBuilder, socket::ListeningSocketSource},
 };
 
@@ -129,8 +133,9 @@ use crate::{
     diag, input as input_mod, marker,
     render::{
         adopted_elements, cursor_element, default_cursor_element, popup_elements, send_frames,
-        send_presentation_feedback, splice_adopted, DrmRenderElements,
+        send_presentation_feedback, splice_adopted, DrmGlesRenderElements, DrmRenderElements,
     },
+    rounded::{ensure_rounded_program, roundable_windows, rounded_element_for},
     runtime_bridge::BridgeServer,
     server::{ClientEvent, ClientState, GenesisState},
 };
@@ -480,21 +485,56 @@ fn render_drm(data: &mut StandaloneLoop) -> Result<bool, Box<dyn std::error::Err
     };
     let presented = match renderer {
         DrmRenderer::Gles(mut renderer) => {
-            let result = render_with(state, &mut output.compositor, &mut *renderer);
+            // Polish surface (b): compile the rounded-corner program on
+            // the first frame (lazy — the renderer is created above).
+            ensure_rounded_program(state, &mut renderer);
+            // The frame and the capture collect independently, as
+            // before: a frame collect failure propagates as the render
+            // error, while a capture collect failure becomes the
+            // capture's error reply.
+            let result = match collect_drm_elements_gles(state, &mut renderer) {
+                Ok(elements) => {
+                    render_with(state, &mut output.compositor, &mut *renderer, &elements)
+                }
+                Err(err) => Err(err),
+            };
             if let Some(request) = state.capture_request.take() {
-                run_capture_drm::<GlesRenderer, GlesTexture>(state, &mut *renderer, request);
+                match collect_drm_elements_gles(state, &mut renderer) {
+                    Ok(elements) => run_capture_drm::<
+                        GlesRenderer,
+                        GlesTexture,
+                        DrmGlesRenderElements,
+                    >(state, &mut *renderer, request, &elements),
+                    Err(err) => crate::capture::resolve_capture(
+                        state,
+                        request,
+                        Err(format!("capture failed: cannot collect scene: {err}")),
+                    ),
+                }
             }
             state.drm_renderer = Some(DrmRenderer::Gles(renderer));
             result?
         }
         DrmRenderer::Pixman(mut renderer) => {
-            let result = render_with(state, &mut output.compositor, &mut renderer);
+            let result = match collect_drm_elements(state, &mut renderer) {
+                Ok(elements) => {
+                    render_with(state, &mut output.compositor, &mut renderer, &elements)
+                }
+                Err(err) => Err(err),
+            };
             if let Some(request) = state.capture_request.take() {
-                run_capture_drm::<PixmanRenderer, pixman::Image<'static, 'static>>(
-                    state,
-                    &mut renderer,
-                    request,
-                );
+                match collect_drm_elements(state, &mut renderer) {
+                    Ok(elements) => run_capture_drm::<
+                        PixmanRenderer,
+                        pixman::Image<'static, 'static>,
+                        DrmRenderElements<PixmanRenderer>,
+                    >(state, &mut renderer, request, &elements),
+                    Err(err) => crate::capture::resolve_capture(
+                        state,
+                        request,
+                        Err(format!("capture failed: cannot collect scene: {err}")),
+                    ),
+                }
             }
             state.drm_renderer = Some(DrmRenderer::Pixman(renderer));
             result?
@@ -530,14 +570,25 @@ fn render_drm(data: &mut StandaloneLoop) -> Result<bool, Box<dyn std::error::Err
 /// capture pass so both render the same scene — including the cursor,
 /// which the standalone backend draws but the nested backend leaves
 /// to the parent compositor.
-fn collect_drm_elements<R>(
+///
+/// Generic over the element enum `E` so the GLES and Pixman paths
+/// share one scene body: the GLES path uses the concrete
+/// `DrmGlesRenderElements` (which can hold the rounded variant) and
+/// the Pixman path the generic `DrmRenderElements<R>`. The variants
+/// convert via the macro-generated `From` impls.
+fn collect_drm_scene<R, E>(
     state: &GenesisState,
     renderer: &mut R,
-) -> Result<Vec<DrmRenderElements<R>>, Box<dyn std::error::Error>>
+) -> Result<Vec<E>, Box<dyn std::error::Error>>
 where
     R: Renderer + ImportAll + ImportMem + ImportMemWl + ImportDmaWl,
     R::TextureId: Clone + Texture + Send + 'static,
     R::Error: 'static,
+    E: Element
+        + From<WaylandSurfaceRenderElement<R>>
+        + From<Wrap<WaylandSurfaceRenderElement<R>>>
+        + From<CropRenderElement<WaylandSurfaceRenderElement<R>>>
+        + From<MemoryRenderBufferRenderElement<R>>,
 {
     let scale = state.output_scale as f64;
     // `render_elements_for_output` takes the frame alpha, not the
@@ -547,43 +598,88 @@ where
     // output's LayerMap — see `space_render_elements`.)
     // The space returns `Surface` elements for layer surfaces and
     // `Element(Wrap<...>)` elements for windows; both convert into
-    // `DrmRenderElements` leaf variants.
-    let mut elements: Vec<DrmRenderElements<R>> = state
+    // the scene enum's leaf variants.
+    let mut elements: Vec<E> = state
         .space
         .render_elements_for_output(renderer, &state.output, 1.0)?
         .into_iter()
         .map(|element| match element {
-            SpaceRenderElements::Surface(element) => DrmRenderElements::Surface(element),
-            SpaceRenderElements::Element(element) => DrmRenderElements::Wrapped(element),
+            SpaceRenderElements::Surface(element) => E::from(element),
+            SpaceRenderElements::Element(element) => E::from(element),
             SpaceRenderElements::_GenericCatcher(_) => unreachable!(),
         })
         .collect();
     // Stage 4: each adoption's clipped Chromium elements, spliced in
     // immediately above its Browser window's elements — the same
     // placement and clipping as the nested backend (see `render.rs`).
-    let adopted: Vec<(smithay::desktop::Window, Vec<DrmRenderElements<R>>)> =
-        adopted_elements(state, renderer, scale)
-            .into_iter()
-            .map(|(window, cropped)| {
-                (
-                    window,
-                    cropped
-                        .into_iter()
-                        .map(DrmRenderElements::Cropped)
-                        .collect(),
-                )
-            })
-            .collect();
+    let adopted: Vec<(smithay::desktop::Window, Vec<E>)> = adopted_elements(state, renderer, scale)
+        .into_iter()
+        .map(|(window, cropped)| (window, cropped.into_iter().map(E::from).collect()))
+        .collect();
     elements = splice_adopted(elements, adopted);
     elements.extend(
         popup_elements(state, renderer, scale)
             .into_iter()
-            .map(DrmRenderElements::Surface),
+            .map(E::from),
     );
     if let Some(cursor) = cursor_element(state, renderer, scale) {
-        elements.push(DrmRenderElements::Surface(cursor));
+        elements.push(E::from(cursor));
     } else if let Some(cursor) = default_cursor_element(state, renderer) {
-        elements.push(DrmRenderElements::Memory(cursor));
+        elements.push(E::from(cursor));
+    }
+    Ok(elements)
+}
+
+/// The Pixman path's scene: the generic enum, no rounding (the Pixman
+/// fallback renders square — see `rounded.rs`).
+fn collect_drm_elements<R>(
+    state: &GenesisState,
+    renderer: &mut R,
+) -> Result<Vec<DrmRenderElements<R>>, Box<dyn std::error::Error>>
+where
+    R: Renderer + ImportAll + ImportMem + ImportMemWl + ImportDmaWl,
+    R::TextureId: Clone + Texture + Send + 'static,
+    R::Error: 'static,
+{
+    collect_drm_scene(state, renderer)
+}
+
+/// The GLES path's scene: the concrete enum, with normal-state
+/// toplevel windows rounded (polish surface (b)). The swap is the
+/// same shape as the nested backend's (`backend.rs`): only Wrapped
+/// roots are replaced, in place, so stacking order is preserved.
+fn collect_drm_elements_gles(
+    state: &GenesisState,
+    renderer: &mut GlesRenderer,
+) -> Result<Vec<DrmGlesRenderElements>, Box<dyn std::error::Error>> {
+    let mut elements = collect_drm_scene(state, renderer)?;
+    if let Some(program) = &state.rounded_program {
+        let roundable = roundable_windows(state);
+        if !roundable.is_empty() {
+            let scale = Scale::from(state.output_scale as f64);
+            elements = elements
+                .into_iter()
+                .map(|element| {
+                    let DrmGlesRenderElements::Wrapped(wrapped) = &element else {
+                        return element;
+                    };
+                    let Some(surface) = roundable.get(wrapped.id()) else {
+                        return element;
+                    };
+                    let Some(rounded) = rounded_element_for(
+                        renderer,
+                        program,
+                        surface,
+                        wrapped.location(scale),
+                        wrapped.alpha(),
+                        wrapped.kind(),
+                    ) else {
+                        return element;
+                    };
+                    DrmGlesRenderElements::Rounded(rounded)
+                })
+                .collect();
+        }
     }
     Ok(elements)
 }
@@ -600,14 +696,16 @@ where
 /// queue. Its pixels are proven downstream (the QMP screendump
 /// oracle in the SevynOS m13 check), not in this repo's CI — CI has
 /// no DRM device.
-fn run_capture_drm<R, T>(
+fn run_capture_drm<R, T, E>(
     state: &mut GenesisState,
     renderer: &mut R,
     request: crate::capture::CaptureRequest,
+    elements: &[E],
 ) where
     R: Renderer + Offscreen<T> + ExportMem + ImportAll + ImportMem + ImportMemWl + ImportDmaWl,
     R::TextureId: Clone + Texture + Send + 'static,
     R::Error: std::fmt::Debug + 'static,
+    E: RenderElement<R>,
 {
     if let Some(detail) = crate::capture::sensitive_surface_visible(state) {
         marker!("CAPTURE REFUSED reason=sensitive-surface detail={detail}");
@@ -622,11 +720,7 @@ fn run_capture_drm<R, T>(
     let size = state
         .output_transform
         .transform_size(state.output_physical_size);
-    let outcome = (|| -> Result<crate::capture::CapturedFrame, String> {
-        let elements = collect_drm_elements(state, renderer)
-            .map_err(|err| format!("capture failed: cannot collect scene: {err}"))?;
-        crate::capture::capture_offscreen::<R, T, DrmRenderElements<R>>(renderer, &elements, size)
-    })();
+    let outcome = crate::capture::capture_offscreen::<R, T, E>(renderer, elements, size);
     crate::capture::resolve_capture(state, request, outcome);
 }
 
@@ -640,22 +734,26 @@ fn run_capture_drm<R, T>(
 /// compositor considers for the hardware cursor plane — the
 /// client-set surface when there is one, the built-in default arrow
 /// otherwise (see `render::default_cursor_element`). Elements are
-/// wrapped in `DrmRenderElements` because the default arrow is a
-/// memory-backed element, not a surface element.
-fn render_with<R>(
+/// wrapped in a `DrmRenderElements` enum because the default arrow is a
+/// memory-backed element, not a surface element. The element list is
+/// collected by the caller (`render_drm` arm) so the GLES path can use
+/// the concrete `DrmGlesRenderElements` and the Pixman path the generic
+/// `DrmRenderElements<R>`.
+fn render_with<R, E>(
     state: &mut GenesisState,
     compositor: &mut GenesisDrmCompositor,
     renderer: &mut R,
+    elements: &[E],
 ) -> Result<bool, Box<dyn std::error::Error>>
 where
     R: Renderer + Bind<Dmabuf> + ImportAll + ImportMem + ImportMemWl + ImportDmaWl,
     R::TextureId: Clone + Texture + Send + 'static,
     R::Error: 'static,
+    E: RenderElement<R>,
 {
-    let elements = collect_drm_elements(state, renderer)?;
     let frame = compositor.render_frame(
         renderer,
-        &elements,
+        elements,
         Color32F::new(0.05, 0.05, 0.08, 1.0),
         FrameFlags::DEFAULT,
     )?;

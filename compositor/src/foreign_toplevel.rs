@@ -76,7 +76,7 @@
 use std::collections::HashSet;
 
 use smithay::{
-    desktop::Window,
+    desktop::{layer_map_for_output, Window},
     reexports::{
         wayland_protocols::xdg::shell::server::xdg_toplevel::State as ToplevelState,
         wayland_server::{
@@ -84,7 +84,7 @@ use smithay::{
             Resource, Weak,
         },
     },
-    utils::{Logical, Point},
+    utils::{Logical, Point, Rectangle},
     wayland::{
         foreign_toplevel_list::{
             ForeignToplevelHandle, ForeignToplevelListHandler, ForeignToplevelListState,
@@ -849,14 +849,26 @@ impl GenesisState {
         marker!("MANAGER MINIMIZE id={surface_id} minimized={minimized}");
     }
 
+    /// The work area: the output minus the shell's exclusive zone (the
+    /// top bar). A maximized window fills this, not the whole output —
+    /// the top bar stays visible (layout manifest §3, polish surface
+    /// (b)). With no exclusive zone reserved the work area IS the
+    /// output, so this is behavior-preserving until the shell sets its
+    /// zone (the SevynOS shell reserves 48px with the surface-(b)
+    /// SevynOS PR; surface (c) sets 32px and maximize follows
+    /// automatically — no second Genesis change).
+    fn work_area(&self) -> Rectangle<i32, Logical> {
+        layer_map_for_output(&self.output).non_exclusive_zone()
+    }
+
     /// Manager `set_maximized` / `unset_maximized`: set the
     /// xdg-toplevel Maximized state and send a configure (with the
-    /// output size while maximized, so the client resizes to fill
-    /// it). Maximizing moves the window to (0, 0), saving its
-    /// location; unmaximizing restores it once neither Maximized nor
-    /// Fullscreen remains. Maximizing a minimized window restores
-    /// it first — a maximized window is visible by definition, so
-    /// the two states are contradictory.
+    /// work-area size while maximized, so the client resizes to fill
+    /// the area below the top bar). Maximizing moves the window to the
+    /// work-area origin, saving its location; unmaximizing restores it
+    /// once neither Maximized nor Fullscreen remains. Maximizing a
+    /// minimized window restores it first — a maximized window is
+    /// visible by definition, so the two states are contradictory.
     pub fn manager_set_maximized(&mut self, surface_id: u64, maximized: bool) {
         self.ensure_entry_for_record(surface_id);
         if maximized && self.is_minimized(surface_id) {
@@ -881,14 +893,14 @@ impl GenesisState {
         toplevel.with_pending_state(|pending| {
             if maximized {
                 pending.states.set(ToplevelState::Maximized);
-                pending.size = Some(self.output_size);
+                pending.size = Some(self.work_area().size);
             } else {
                 pending.states.unset(ToplevelState::Maximized);
                 pending.size = None;
             }
         });
         toplevel.send_configure();
-        self.move_for_fullscreen_state(surface_id, &window, maximized);
+        self.move_for_expanded_state(surface_id, &window, maximized, false);
         self.send_manager_state(surface_id);
         marker!("MANAGER MAXIMIZE id={surface_id} maximized={maximized}");
     }
@@ -931,16 +943,25 @@ impl GenesisState {
             }
         });
         toplevel.send_configure();
-        self.move_for_fullscreen_state(surface_id, &window, fullscreen);
+        self.move_for_expanded_state(surface_id, &window, fullscreen, true);
         self.send_manager_state(surface_id);
         marker!("MANAGER FULLSCREEN id={surface_id} fullscreen={fullscreen}");
     }
 
     /// Shared maximize/fullscreen placement: on entering either
-    /// state, save the window's location (once) and move it to
-    /// (0, 0); on leaving one, restore the saved location only when
-    /// neither Maximized nor Fullscreen remains.
-    fn move_for_fullscreen_state(&mut self, surface_id: u64, window: &Window, entering: bool) {
+    /// state, save the window's location (once) and move it — to the
+    /// work-area origin for maximize (below the top bar), to (0, 0)
+    /// for fullscreen (the top bar hides with it, which is correct:
+    /// the bar is part of the shell's Background layer surface,
+    /// underneath windows). On leaving one, restore the saved location
+    /// only when neither Maximized nor Fullscreen remains.
+    fn move_for_expanded_state(
+        &mut self,
+        surface_id: u64,
+        window: &Window,
+        entering: bool,
+        fullscreen: bool,
+    ) {
         if entering {
             let location = self.space.element_location(window);
             if let Some(entry) = self.foreign_toplevel_manager_state.entry_mut(surface_id) {
@@ -948,7 +969,15 @@ impl GenesisState {
                     entry.saved_location = location;
                 }
             }
-            self.space.map_element(window.clone(), (0, 0), false);
+            // Maximized fills the work area (below the top bar);
+            // fullscreen covers the whole output (the top bar hides
+            // with it).
+            if fullscreen {
+                self.space.map_element(window.clone(), (0, 0), false);
+            } else {
+                self.space
+                    .map_element(window.clone(), self.work_area().loc, false);
+            }
         } else {
             let (maximized, fullscreen) = self
                 .registry
