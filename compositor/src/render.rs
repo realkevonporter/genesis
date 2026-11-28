@@ -15,6 +15,7 @@ use smithay::{
             utils::CropRenderElement,
             Element, Id, Kind, Wrap,
         },
+        gles::GlesRenderer,
         ImportAll, ImportDmaWl, ImportMem, ImportMemWl, Renderer,
     },
     desktop::{layer_map_for_output, PopupManager, Window},
@@ -27,7 +28,7 @@ use smithay::{
     },
 };
 
-use crate::{cursor::CURSOR_SIZE, server::GenesisState};
+use crate::{cursor::CURSOR_SIZE, rounded::RoundedCornersElement, server::GenesisState};
 
 // The render-element type for the standalone (DRM) backend: the
 // scene's surface elements plus the built-in default cursor, which is
@@ -43,6 +44,11 @@ use crate::{cursor::CURSOR_SIZE, server::GenesisState};
 // (`ImportAll` is only implemented for renderers that also implement
 // `ImportMemWl` + `ImportDmaWl`, so those bounds are spelled out
 // here and in `drm.rs::render_with`.)
+//
+// This generic enum is the PIXMAN path's scene type (see
+// `drm.rs::collect_drm_elements`): a GLES-only rounded variant cannot
+// live in a generic enum, so the GLES path uses the concrete
+// `DrmGlesRenderElements` below and renders square here instead.
 smithay::backend::renderer::element::render_elements! {
     pub DrmRenderElements<R> where R: ImportAll + ImportMem + ImportMemWl + ImportDmaWl;
     Surface=WaylandSurfaceRenderElement<R>,
@@ -52,18 +58,44 @@ smithay::backend::renderer::element::render_elements! {
     Cropped=CropRenderElement<WaylandSurfaceRenderElement<R>>,
 }
 
+// The render-element type for the DRM backend's GLES path: the same
+// scene as `DrmRenderElements`, plus the rounded-corner variant (see
+// `rounded.rs`). Concrete (`<=GlesRenderer`) because the rounded
+// element is GLES-only — the generic enum above cannot hold it (the
+// macro generates a fully generic `RenderElement<R>` impl, and the
+// Pixman path has no GLES program to draw with).
+smithay::backend::renderer::element::render_elements! {
+    pub DrmGlesRenderElements<=GlesRenderer>;
+    Surface=WaylandSurfaceRenderElement<GlesRenderer>,
+    Wrapped=Wrap<WaylandSurfaceRenderElement<GlesRenderer>>,
+    Memory=MemoryRenderBufferRenderElement<GlesRenderer>,
+    /// A surface element clipped to its adoption rect (Stage 4).
+    Cropped=CropRenderElement<WaylandSurfaceRenderElement<GlesRenderer>>,
+    /// A toplevel window's root surface, drawn with the rounded-corner
+    /// shader (polish surface (b)). Only normal-state windows; see
+    /// `drm.rs::collect_drm_elements_gles`.
+    Rounded=RoundedCornersElement,
+}
+
 // The render-element type for the nested (winit) backend: the scene's
 // surface elements plus the clipped adopted elements. The nested
 // backend draws no memory-backed cursor (the parent compositor draws
 // it), so there is no `Memory` variant here — the only difference
 // from `DrmRenderElements`. (A plain comment, not a doc comment:
 // rustdoc does not generate documentation for macro invocations.)
+//
+// Concrete (`<=GlesRenderer`): the nested backend is GLES-only, and
+// the rounded variant needs a concrete renderer type (see above).
 smithay::backend::renderer::element::render_elements! {
-    pub NestedRenderElements<R> where R: ImportAll + ImportMem + ImportMemWl + ImportDmaWl;
-    Surface=WaylandSurfaceRenderElement<R>,
-    Wrapped=Wrap<WaylandSurfaceRenderElement<R>>,
+    pub NestedRenderElements<=GlesRenderer>;
+    Surface=WaylandSurfaceRenderElement<GlesRenderer>,
+    Wrapped=Wrap<WaylandSurfaceRenderElement<GlesRenderer>>,
     /// A surface element clipped to its adoption rect (Stage 4).
-    Cropped=CropRenderElement<WaylandSurfaceRenderElement<R>>,
+    Cropped=CropRenderElement<WaylandSurfaceRenderElement<GlesRenderer>>,
+    /// A toplevel window's root surface, drawn with the rounded-corner
+    /// shader (polish surface (b)). Only normal-state windows; see
+    /// `backend.rs::collect_nested_elements`.
+    Rounded=RoundedCornersElement,
 }
 
 /// The clipped render elements for every live adoption, one entry per

@@ -63,6 +63,7 @@ mod input;
 mod logging;
 mod output;
 mod render;
+mod rounded;
 mod runtime_bridge;
 mod server;
 mod surface_registry;

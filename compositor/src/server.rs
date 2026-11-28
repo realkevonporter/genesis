@@ -21,7 +21,7 @@ use std::sync::{Arc, Mutex};
 
 use calloop::EventLoop;
 use smithay::{
-    backend::renderer::element::memory::MemoryRenderBuffer,
+    backend::renderer::{element::memory::MemoryRenderBuffer, gles::GlesTexProgram},
     delegate_compositor, delegate_content_type, delegate_cursor_shape, delegate_dmabuf,
     delegate_foreign_toplevel_list, delegate_idle_inhibit, delegate_idle_notify,
     delegate_layer_shell, delegate_output, delegate_presentation, delegate_seat, delegate_shm,
@@ -239,6 +239,15 @@ pub struct GenesisState {
     /// no client-set cursor surface and the cursor is not hidden, so
     /// the pointer is never invisible.
     pub default_cursor: MemoryRenderBuffer,
+    /// The rounded-corner texture program (see `rounded.rs`), compiled
+    /// lazily on the first GLES frame and shared by the nested and DRM
+    /// backends. `None` until compiled (or when compilation failed —
+    /// see `rounded_program_failed`); the Pixman fallback never uses
+    /// it and renders square.
+    pub rounded_program: Option<GlesTexProgram>,
+    /// Set when the rounded-corner program failed to compile: the
+    /// compositor keeps rendering square and never retries.
+    pub rounded_program_failed: bool,
 
     /// Serials handed to clients for input/focus events.
     serial_counter: u32,
@@ -439,6 +448,8 @@ impl GenesisState {
             cursor_named: None,
             cursor_hidden: false,
             default_cursor: build_default_cursor_buffer(),
+            rounded_program: None,
+            rounded_program_failed: false,
             serial_counter: 1,
             pointer_location: (0.0, 0.0).into(),
             pointer_focus_id: None,
