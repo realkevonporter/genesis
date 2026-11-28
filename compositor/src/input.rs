@@ -305,6 +305,11 @@ pub fn pointer_motion(
     // these are the choke points for both backends.
     state.note_input_activity();
     state.pointer_location = location;
+    // The cursor is drawn at `pointer_location` at render time, and
+    // both backends render only when `needs_redraw` is set — so motion
+    // must request a frame, or the cursor only jumps when an unrelated
+    // event (a click, a surface commit) draws one.
+    state.needs_redraw = true;
     let hit = hit_test(state, location);
     let focus = hit
         .as_ref()
